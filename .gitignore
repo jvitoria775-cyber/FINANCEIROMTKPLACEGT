@@ -1,0 +1,21 @@
+# Ambientes virtuais Python
+.venv/
+env/
+venv/
+ENV/
+
+# Caches e compilações Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Banco de dados local (gerado automaticamente pelo app.py no primeiro boot)
+*.db-journal
+
+# Logs e arquivos temporários do sistema
+*.log
+.system_generated/
+.DS_Store
+Thumbs.db
