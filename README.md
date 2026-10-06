@@ -61,3 +61,25 @@ $$\text{Lucro Líquido Real} = \text{Saque Líquido Previsto} - (\text{Custo Uni
 Na pasta `exemplos/`, foram criadas duas planilhas para validação imediata:
 - `exemplos/exemplo_anuncios_upseller.xlsx`: Exemplo de anúncios cadastrais.
 - `exemplos/exemplo_vendas_upseller.xlsx`: Exemplo de vendas com cupons aplicados pelo cliente.
+
+---
+
+## 🌐 Publicação Gratuita na Nuvem (Deploy)
+
+### 1. Subir para o GitHub
+Execute o arquivo [`subir_github.bat`](subir_github.bat) ou rode no terminal:
+```bash
+git push -u origin main
+```
+
+### 2. Por que usar Streamlit Community Cloud em vez da Vercel?
+- A **Vercel** foi projetada para sites estáticos e funções *serverless* efêmeras (cada requisição apaga o disco local, o que destruiria o banco SQLite e cortaria as conexões WebSocket do Streamlit).
+- O **Streamlit Community Cloud (share.streamlit.io)** é a plataforma oficial, **100% gratuita para sempre**, com servidor persistente, certificado SSL e suporte nativo a WebSockets e SQLite.
+
+### 3. Como colocar no ar em 2 minutos (Streamlit Cloud):
+1. Acesse [share.streamlit.io](https://share.streamlit.io/) e faça login com sua conta do GitHub.
+2. Clique em **"New app"**.
+3. Selecione o repositório: `jvitoria775-cyber/FINANCEIROMTKPLACEGT`.
+4. Branch: `main` | Main file path: `app.py`.
+5. Clique em **"Deploy!"**.
+6. Seu painel estará publicado e acessível publicamente via link HTTPS gratuito!
