@@ -317,84 +317,123 @@ class DatabaseManager:
             conn.commit()
 
     @classmethod
-    def upsert_sales(cls, sales: List[Dict[str, Any]]) -> Tuple[int, int]:
+    def get_existing_pedido_ids(cls) -> set:
+        """Retorna o conjunto com todos os pedido_id já gravados no banco de dados."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT pedido_id FROM vendas_processadas")
+            return {str(row["pedido_id"]) for row in cursor.fetchall()}
+
+    @classmethod
+    def upsert_sales(cls, sales: List[Dict[str, Any]], ignorar_existentes: bool = True) -> Tuple[int, int]:
         """
         Insere ou atualiza vendas processadas de maneira idempotente.
-        Retorna (novas_inseridas, atualizadas).
+        Se ignorar_existentes=True: pula pedidos que já foram inseridos anteriormente, ignorando-os.
+        Se ignorar_existentes=False: atualiza os registros existentes com os novos cálculos.
+        Retorna (novas_inseridas, repetidas_ignoradas_ou_atualizadas).
         """
         if not sales:
             return 0, 0
 
         novas = 0
-        atualizadas = 0
+        repetidas = 0
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             for s in sales:
+                pid = str(s["pedido_id"])
                 cursor.execute(
                     "SELECT pedido_id FROM vendas_processadas WHERE pedido_id = ?",
-                    (str(s["pedido_id"]),),
+                    (pid,),
                 )
                 exists = cursor.fetchone()
 
                 if exists:
-                    atualizadas += 1
+                    repetidas += 1
+                    if ignorar_existentes:
+                        # Venda repetida ignorada: mantém os dados intactos e não duplica
+                        continue
+                    else:
+                        cursor.execute(
+                            """
+                            UPDATE vendas_processadas SET
+                                numero_venda = ?,
+                                tag_item = ?,
+                                canal = ?,
+                                id_variante = ?,
+                                sku = ?,
+                                nome_anuncio = ?,
+                                quantidade = ?,
+                                preco_upseller_registrado = ?,
+                                preco_base_anuncio = ?,
+                                faturamento_bruto = ?,
+                                total_taxas_canal = ?,
+                                valor_imposto = ?,
+                                saque_liquido_previsto = ?,
+                                custo_cmv_total = ?,
+                                lucro_liquido_real = ?,
+                                data_pedido = COALESCE(NULLIF(?, ''), vendas_processadas.data_pedido),
+                                data_processamento = ?
+                            WHERE pedido_id = ?
+                            """,
+                            (
+                                str(s.get("numero_venda") or pid),
+                                str(s.get("tag_item") or "Item Único"),
+                                s.get("canal", ""),
+                                s.get("id_variante", ""),
+                                s.get("sku", ""),
+                                s.get("nome_anuncio", ""),
+                                int(s.get("quantidade", 1)),
+                                float(s.get("preco_upseller_registrado", 0.0)),
+                                float(s.get("preco_base_anuncio", 0.0)),
+                                float(s.get("faturamento_bruto", 0.0)),
+                                float(s.get("total_taxas_canal", 0.0)),
+                                float(s.get("valor_imposto", 0.0)),
+                                float(s.get("saque_liquido_previsto", 0.0)),
+                                float(s.get("custo_cmv_total", 0.0)),
+                                float(s.get("lucro_liquido_real", 0.0)),
+                                s.get("data_pedido", now),
+                                now,
+                                pid,
+                            ),
+                        )
                 else:
                     novas += 1
-
-                cursor.execute(
-                    """
-                    INSERT INTO vendas_processadas (
-                        pedido_id, numero_venda, tag_item, canal, id_variante, sku, nome_anuncio,
-                        quantidade, preco_upseller_registrado, preco_base_anuncio,
-                        faturamento_bruto, total_taxas_canal, valor_imposto,
-                        saque_liquido_previsto, custo_cmv_total, lucro_liquido_real,
-                        data_pedido, data_processamento
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(pedido_id) DO UPDATE SET
-                        numero_venda = excluded.numero_venda,
-                        tag_item = excluded.tag_item,
-                        canal = excluded.canal,
-                        id_variante = excluded.id_variante,
-                        sku = excluded.sku,
-                        nome_anuncio = excluded.nome_anuncio,
-                        quantidade = excluded.quantidade,
-                        preco_upseller_registrado = excluded.preco_upseller_registrado,
-                        preco_base_anuncio = excluded.preco_base_anuncio,
-                        faturamento_bruto = excluded.faturamento_bruto,
-                        total_taxas_canal = excluded.total_taxas_canal,
-                        valor_imposto = excluded.valor_imposto,
-                        saque_liquido_previsto = excluded.saque_liquido_previsto,
-                        custo_cmv_total = excluded.custo_cmv_total,
-                        lucro_liquido_real = excluded.lucro_liquido_real,
-                        data_pedido = COALESCE(NULLIF(excluded.data_pedido, ''), vendas_processadas.data_pedido),
-                        data_processamento = excluded.data_processamento
-                    """,
-                    (
-                        str(s["pedido_id"]),
-                        str(s.get("numero_venda") or s["pedido_id"]),
-                        str(s.get("tag_item") or "Item Único"),
-                        s.get("canal", ""),
-                        s.get("id_variante", ""),
-                        s.get("sku", ""),
-                        s.get("nome_anuncio", ""),
-                        int(s.get("quantidade", 1)),
-                        float(s.get("preco_upseller_registrado", 0.0)),
-                        float(s.get("preco_base_anuncio", 0.0)),
-                        float(s.get("faturamento_bruto", 0.0)),
-                        float(s.get("total_taxas_canal", 0.0)),
-                        float(s.get("valor_imposto", 0.0)),
-                        float(s.get("saque_liquido_previsto", 0.0)),
-                        float(s.get("custo_cmv_total", 0.0)),
-                        float(s.get("lucro_liquido_real", 0.0)),
-                        s.get("data_pedido", now),
-                        now,
-                    ),
-                )
+                    cursor.execute(
+                        """
+                        INSERT INTO vendas_processadas (
+                            pedido_id, numero_venda, tag_item, canal, id_variante, sku, nome_anuncio,
+                            quantidade, preco_upseller_registrado, preco_base_anuncio,
+                            faturamento_bruto, total_taxas_canal, valor_imposto,
+                            saque_liquido_previsto, custo_cmv_total, lucro_liquido_real,
+                            data_pedido, data_processamento
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            pid,
+                            str(s.get("numero_venda") or pid),
+                            str(s.get("tag_item") or "Item Único"),
+                            s.get("canal", ""),
+                            s.get("id_variante", ""),
+                            s.get("sku", ""),
+                            s.get("nome_anuncio", ""),
+                            int(s.get("quantidade", 1)),
+                            float(s.get("preco_upseller_registrado", 0.0)),
+                            float(s.get("preco_base_anuncio", 0.0)),
+                            float(s.get("faturamento_bruto", 0.0)),
+                            float(s.get("total_taxas_canal", 0.0)),
+                            float(s.get("valor_imposto", 0.0)),
+                            float(s.get("saque_liquido_previsto", 0.0)),
+                            float(s.get("custo_cmv_total", 0.0)),
+                            float(s.get("lucro_liquido_real", 0.0)),
+                            s.get("data_pedido", now),
+                            now,
+                        ),
+                    )
             conn.commit()
 
-        return novas, atualizadas
+        return novas, repetidas
 
     @classmethod
     def get_sales_dataframe(cls, canal_filtro: Optional[str] = None) -> pd.DataFrame:
@@ -2046,9 +2085,10 @@ def main():
                     df_raw_vendas = DataProcessor.read_uploaded_file(file_vendas)
                     st.success(f"Arquivo de vendas carregado: **{len(df_raw_vendas)} linhas**.")
 
-                    # Carregar configurações e catálogo do banco
+                    # Carregar configurações, catálogo e IDs existentes do banco
                     configs = DatabaseManager.get_channel_configs()
                     df_prods_catalog = DatabaseManager.get_products_dataframe()
+                    existing_pedido_ids = DatabaseManager.get_existing_pedido_ids()
 
                     # Executa Conciliação em Memória
                     processed_sales, stats = DataProcessor.reconcile_sales_batch(
@@ -2058,18 +2098,31 @@ def main():
                         df_prods_catalog,
                     )
 
+                    # Contagem de novos vs repetidos no lote
+                    repetidos_lote = sum(1 for s in processed_sales if s["pedido_id"] in existing_pedido_ids)
+                    novos_lote = len(processed_sales) - repetidos_lote
+
                     # Exibe Estatísticas do Lote
+                    cor_badge_rep = "#EF4444" if repetidos_lote > 0 else "#10B981"
                     st.markdown(
                         f"""
                         <div style="background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; margin-bottom: 12px;">
-                            <b>Resumo da Conciliação do Lote:</b><br/>
-                            • Total de Linhas/Itens: <b>{stats['total_pedidos']}</b><br/>
+                            <b style="color: #0f172a; font-size: 1rem;">Resumo da Conciliação do Lote:</b><br/>
+                            • Total de Linhas/Itens no Arquivo: <b>{stats['total_pedidos']}</b><br/>
+                            • Novos Pedidos a Cadastrar: <b style="color: #10B981;">{novos_lote}</b><br/>
+                            • Pedidos Repetidos (já existentes no banco): <b style="color: {cor_badge_rep};">{repetidos_lote}</b> (serão ignorados para não duplicar)<br/>
                             • Itens Vinculados ao Catálogo de Anúncios: <b>{stats['itens_conciliados']}</b> ({stats['taxa_cobertura_pct']}% de cobertura)<br/>
                             • Itens sem Anúncio Pré-Cadastrado: <b>{stats['itens_nao_cadastrados']}</b> (utilizado preço de venda como fallback)<br/>
                         </div>
                         """,
                         unsafe_allow_html=True,
                     )
+
+                    if repetidos_lote > 0:
+                        st.info(
+                            f"ℹ️ **Proteção Antiduplicação Ativa:** Identificamos **{repetidos_lote} pedidos repetidos** que já foram importados anteriormente. "
+                            "O sistema irá ignorá-los automaticamente para que seu faturamento e taxas não sejam duplicados."
+                        )
 
                     if stats["itens_nao_cadastrados"] > 0:
                         st.warning(
@@ -2109,12 +2162,26 @@ def main():
                             hide_index=True,
                         )
 
+                    chk_ignorar = st.checkbox(
+                        "🛡️ Ignorar vendas repetidas já existentes no banco (recomendado para não duplicar)",
+                        value=True,
+                        key="chk_ignorar_repetidos",
+                    )
+
                     if st.button("💾 Confirmar e Gravar Vendas no Banco de Dados", type="primary", key="btn_save_vendas"):
-                        novas, atualizadas = DatabaseManager.upsert_sales(processed_sales)
-                        st.balloons()
-                        st.success(
-                            f"🎉 Vendas gravadas com sucesso! **{novas} novos pedidos inseridos** e **{atualizadas} atualizados**."
-                        )
+                        novas, repetidas = DatabaseManager.upsert_sales(processed_sales, ignorar_existentes=chk_ignorar)
+                        if novas > 0 and repetidas > 0:
+                            st.balloons()
+                            st.success(
+                                f"🎉 Conciliação gravada com sucesso! **{novas} novos pedidos inseridos** e **{repetidas} pedidos repetidos foram ignorados** (nenhuma duplicação)."
+                            )
+                        elif novas > 0:
+                            st.balloons()
+                            st.success(f"🎉 **{novas} novos pedidos** inseridos com sucesso no banco de dados!")
+                        else:
+                            st.info(
+                                f"ℹ️ Todos os **{repetidas} pedidos** desta planilha já haviam sido importados e foram **ignorados**. O faturamento permanece 100% íntegro sem duplicações!"
+                            )
                 except Exception as e:
                     st.error(f"Erro ao conciliar vendas: {str(e)}")
 
