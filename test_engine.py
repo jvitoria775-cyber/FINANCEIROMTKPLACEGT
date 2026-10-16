@@ -344,6 +344,54 @@ def run_tests():
     assert novas_u2 == 0 and rep_u2 == 4, f"Esperado 0 novas e 4 repetidas ignoradas, obtido novas={novas_u2}, rep={rep_u2}"
     print("✅ 12. Separação multicanal automática em planilha unificada e proteção antiduplicação validadas com 100% de sucesso.")
 
+    # 13. Teste de Proteção contra "Pedido de Origem" e Detecção por Padrão de Pedido Shopee
+    tricky_sales_df = pd.DataFrame([
+        {
+            "Pedido de Origem": "261016Q8536637",  # Pedido com formato Shopee mas sem coluna 'Plataforma'
+            "ID da Variante": "VAR_SHP_001",
+            "SKU": "CAMISA-PRETA-G",
+            "Nome do Produto": "Camisa Polo Algodão Premium",
+            "Quantidade": 1,
+            "Preço de Produto": 75.00,  # Preço com cupom pago pelo cliente
+        },
+        {
+            "Pedido de Origem": "261016Qb18Y2Ph",
+            "ID da Variante": "VAR_SHP_001",
+            "SKU": "CAMISA-PRETA-G",
+            "Nome do Produto": "Camisa Polo Algodão Premium",
+            "Quantidade": 2,
+            "Preço de Produto": 80.00,
+        },
+    ])
+
+    processed_tricky, stats_tricky = DataProcessor.reconcile_sales_batch(
+        df_sales=tricky_sales_df,
+        canal="Automático (Detectar pela Planilha Unificada)",
+        channel_configs=current_configs,
+        products_df=prods_df,
+    )
+
+    # Verifica que ambos os pedidos foram reconhecidos como Shopee
+    assert processed_tricky[0]["canal"] == "Shopee", f"Canal incorreto: {processed_tricky[0]['canal']}"
+    assert processed_tricky[1]["canal"] == "Shopee", f"Canal incorreto: {processed_tricky[1]['canal']}"
+    assert "261016Q8536637" not in stats_tricky["canais_detectados"], "Número de pedido virou canal indevidamente!"
+
+    # Verifica que o preço base veio do catálogo (105.00) e não do preço pago com cupom (75.00)
+    # Item 1: Qtd 1, Preço Base 105.00
+    # Fat Bruto: 105.00
+    # Taxas Shopee: 18% (18.90) + 5.00 = 23.90
+    # Imposto (8%): 8.40
+    # Saque Líquido: 105.00 - 23.90 - 8.40 = 72.70
+    p_t1 = processed_tricky[0]
+    assert p_t1["preco_base_anuncio"] == 105.00, f"Preço base não veio do catálogo: {p_t1['preco_base_anuncio']}"
+    assert p_t1["saque_liquido_previsto"] == 72.70, f"Saque líquido incorreto: {p_t1['saque_liquido_previsto']}"
+
+    # Gravar e verificar que configuracoes_canais não foi poluído
+    DatabaseManager.upsert_sales(processed_tricky)
+    all_channels_after = DatabaseManager.get_all_channels()
+    assert "261016Q8536637" not in all_channels_after, "Número de pedido poluiu lista de canais!"
+    print("✅ 13. Reconhecimento automático de pedidos Shopee sem poluição de canais e cálculo de saque validados com sucesso.")
+
     print("=" * 60)
     print("TODOS OS TESTES PASSARAM COM SUCESSO! 🎉")
     print("=" * 60)

@@ -32,9 +32,20 @@ DB_PATH = Path("ecommerce_financeiro.db")
 
 CHANNELS = ["Shopee", "TikTok Shop", "Shein", "Mercado Livre"]
 
+KNOWN_MARKETPLACES = [
+    "Shopee",
+    "TikTok Shop",
+    "Shein",
+    "Mercado Livre",
+    "Amazon",
+    "Magalu",
+    "Kwai Shop",
+    "Nuvemshop",
+]
+
 DEFAULT_CHANNEL_RATES = {
     "Shopee": {
-        "taxa_comissao_pct": 20.0,
+        "taxa_comissao_pct": 18.0,
         "taxa_fixa_unidade": 5.00,
         "aliquota_imposto_pct": 8.0,
     },
@@ -61,11 +72,14 @@ class DatabaseManager:
 
     @classmethod
     def get_all_channels(cls) -> List[str]:
-        """Retorna todos os canais cadastrados no banco ou predefinidos."""
+        """Retorna todos os canais cadastrados no banco ou predefinidos, filtrando apenas marketplaces válidos."""
         with cls.get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT DISTINCT canal FROM configuracoes_canais")
-            db_channels = [row["canal"] for row in cursor.fetchall() if row["canal"]]
+            db_channels = [
+                row["canal"] for row in cursor.fetchall()
+                if row["canal"] and row["canal"] in KNOWN_MARKETPLACES
+            ]
             all_c = list(dict.fromkeys(CHANNELS + db_channels))
             return all_c
 
@@ -94,13 +108,19 @@ class DatabaseManager:
                 """
             )
 
-            # Inserir valores padrão para os canais se não existirem
+            # Limpeza preventiva de canais espúrios (ex: números de pedidos gravados indevidamente como canais)
+            placeholders = ', '.join('?' for _ in KNOWN_MARKETPLACES)
+            cursor.execute(f"DELETE FROM configuracoes_canais WHERE canal NOT IN ({placeholders})", KNOWN_MARKETPLACES)
+
+            # Inserir valores padrão para os canais principais se não existirem
             for canal, taxas in DEFAULT_CHANNEL_RATES.items():
                 cursor.execute(
                     """
-                    INSERT OR IGNORE INTO configuracoes_canais 
+                    INSERT INTO configuracoes_canais 
                     (canal, taxa_comissao_pct, taxa_fixa_unidade, aliquota_imposto_pct)
                     VALUES (?, ?, ?, ?)
+                    ON CONFLICT(canal) DO UPDATE SET
+                        taxa_comissao_pct = CASE WHEN configuracoes_canais.taxa_comissao_pct = 20.0 AND excluded.canal = 'Shopee' THEN 18.0 ELSE configuracoes_canais.taxa_comissao_pct END
                     """,
                     (
                         canal,
@@ -171,6 +191,14 @@ class DatabaseManager:
             # Backfill para registros legados
             cursor.execute("UPDATE vendas_processadas SET numero_venda = pedido_id WHERE numero_venda IS NULL OR numero_venda = ''")
             cursor.execute("UPDATE vendas_processadas SET tag_item = 'Item Único' WHERE tag_item IS NULL OR tag_item = ''")
+
+            # Corrige canais espúrios gravados em vendas_processadas
+            cursor.execute(f"SELECT pedido_id, numero_venda, canal FROM vendas_processadas WHERE canal NOT IN ({placeholders})", KNOWN_MARKETPLACES)
+            invalid_sales = cursor.fetchall()
+            for inv in invalid_sales:
+                corr = DataProcessor.detect_channel_from_order_id(inv["numero_venda"] or inv["pedido_id"]) or "Shopee"
+                cursor.execute("UPDATE vendas_processadas SET canal = ? WHERE pedido_id = ?", (corr, inv["pedido_id"]))
+
             conn.commit()
 
     @classmethod
@@ -357,10 +385,10 @@ class DatabaseManager:
         with cls.get_connection() as conn:
             cursor = conn.cursor()
 
-            # Garante que qualquer canal detectado na planilha conste em configuracoes_canais
+            # Garante que qualquer canal detectado na planilha conste em configuracoes_canais (apenas marketplaces válidos)
             for s in sales:
                 ch = s.get("canal")
-                if ch:
+                if ch and ch in KNOWN_MARKETPLACES:
                     cursor.execute("SELECT canal FROM configuracoes_canais WHERE canal = ?", (ch,))
                     if not cursor.fetchone():
                         def_rate = DEFAULT_CHANNEL_RATES.get(
@@ -508,28 +536,34 @@ class DatabaseManager:
 
             prod_by_variant = {str(p["id_variante"]): p for p in prods if p.get("id_variante")}
             prod_by_sku = {str(p["sku"]).strip().upper(): p for p in prods if p.get("sku")}
+            prod_by_title = {DataProcessor.normalize_str(p["nome_anuncio"]): p for p in prods if p.get("nome_anuncio")}
 
             now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             recalculated_count = 0
 
             for s in sales:
                 canal = s["canal"]
+                if canal not in KNOWN_MARKETPLACES:
+                    canal = DataProcessor.detect_channel_from_order_id(s.get("numero_venda") or s.get("pedido_id")) or "Shopee"
+
                 rates = configs.get(
                     canal,
-                    {
-                        "taxa_comissao_pct": 20.0,
-                        "taxa_fixa_unidade": 5.0,
-                        "aliquota_imposto_pct": 8.0,
-                    },
+                    DEFAULT_CHANNEL_RATES.get(
+                        canal,
+                        {"taxa_comissao_pct": 20.0, "taxa_fixa_unidade": 5.0, "aliquota_imposto_pct": 8.0},
+                    ),
                 )
 
                 id_var = str(s.get("id_variante") or "")
                 sku_val = str(s.get("sku") or "").strip().upper()
+                nome_anuncio_s = str(s.get("nome_anuncio") or "").strip()
 
-                # Busca produto correspondente
+                # Busca produto correspondente no catálogo (variante -> sku -> título)
                 matched_prod = prod_by_variant.get(id_var)
                 if not matched_prod and sku_val:
                     matched_prod = prod_by_sku.get(sku_val)
+                if not matched_prod and nome_anuncio_s:
+                    matched_prod = prod_by_title.get(DataProcessor.normalize_str(nome_anuncio_s))
 
                 if matched_prod:
                     preco_base = float(matched_prod.get("preco_base") or matched_prod.get("preco_cheio") or s["preco_upseller_registrado"])
@@ -553,6 +587,7 @@ class DatabaseManager:
                 cursor.execute(
                     """
                     UPDATE vendas_processadas SET
+                        canal = ?,
                         nome_anuncio = ?,
                         preco_base_anuncio = ?,
                         faturamento_bruto = ?,
@@ -565,6 +600,7 @@ class DatabaseManager:
                     WHERE pedido_id = ?
                     """,
                     (
+                        canal,
                         nome_anuncio,
                         preco_base,
                         fat_bruto,
@@ -627,33 +663,61 @@ class DataProcessor:
             s = s[:-2]
         return s
 
-    @staticmethod
-    def normalize_channel(raw_val: Any, default_channel: str = "Shopee") -> str:
-        """Normaliza o canal/marketplace vindo da planilha para a nomenclatura padrão do sistema."""
-        if raw_val is None or pd.isna(raw_val):
-            return default_channel
-        s = str(raw_val).strip()
+    @classmethod
+    def detect_channel_from_string(cls, val: Any) -> Optional[str]:
+        """Detecta se uma string contém referência a um dos marketplaces conhecidos."""
+        if val is None or pd.isna(val):
+            return None
+        s = str(val).strip().lower()
         if not s:
-            return default_channel
-        s_clean = s.lower()
-        if "shopee" in s_clean:
+            return None
+        if "shopee" in s:
             return "Shopee"
-        elif "tiktok" in s_clean or "tik tok" in s_clean or s_clean == "tts":
+        elif "tiktok" in s or "tik tok" in s or s == "tts" or "bytedance" in s:
             return "TikTok Shop"
-        elif "shein" in s_clean:
+        elif "shein" in s:
             return "Shein"
-        elif "mercado" in s_clean or "livre" in s_clean or s_clean == "ml":
+        elif "mercado" in s or "livre" in s or s == "ml" or "meli" in s:
             return "Mercado Livre"
-        elif "amazon" in s_clean:
+        elif "amazon" in s:
             return "Amazon"
-        elif "magalu" in s_clean or "magazine" in s_clean:
+        elif "magalu" in s or "magazine" in s:
             return "Magalu"
-        elif "kwai" in s_clean:
+        elif "kwai" in s:
             return "Kwai Shop"
-        elif "nuvem" in s_clean:
+        elif "nuvem" in s:
             return "Nuvemshop"
-        else:
-            return s.title()
+        return None
+
+    @classmethod
+    def detect_channel_from_order_id(cls, order_id: Any) -> Optional[str]:
+        """Identifica o marketplace pelo padrão do número do pedido."""
+        if order_id is None or pd.isna(order_id):
+            return None
+        oid = str(order_id).strip().upper()
+        if not oid:
+            return None
+        # Padrão Shopee: ex: 261016Q8536637 ou 241016Q... (data YYMMDD seguida de letra como Q)
+        if re.match(r"^\d{6}[A-Z0-9]{6,15}$", oid) and any(c.isalpha() for c in oid[6:]):
+            return "Shopee"
+        # Padrão TikTok Shop: numérico de 15 a 19 dígitos iniciando com 57 ou 58, ou TTS
+        if re.match(r"^5[78]\d{13,17}$", oid) or "TTS" in oid:
+            return "TikTok Shop"
+        # Padrão Shein: inicia com GSO ou GSON ou GS, ou SHEIN
+        if oid.startswith("GSO") or oid.startswith("GS") or "SHEIN" in oid:
+            return "Shein"
+        # Padrão Mercado Livre: 10 a 16 dígitos numéricos
+        if re.match(r"^(20000|4\d{9}|\d{10,16})$", oid):
+            return "Mercado Livre"
+        return None
+
+    @classmethod
+    def normalize_channel(cls, raw_val: Any, default_channel: str = "Shopee") -> str:
+        """Normaliza o canal/marketplace para um marketplace válido garantido."""
+        detected = cls.detect_channel_from_string(raw_val)
+        if detected:
+            return detected
+        return default_channel if default_channel in KNOWN_MARKETPLACES else "Shopee"
 
     @staticmethod
     def normalize_str(val: Any) -> str:
@@ -714,20 +778,26 @@ class DataProcessor:
             return s[:19]
 
     @classmethod
-    def find_column(cls, df_columns: List[str], synonyms: List[str]) -> Optional[str]:
-        """Localiza uma coluna no DataFrame baseando-se em sinônimos normalizados."""
+    def find_column(cls, df_columns: List[str], synonyms: List[str], exclude_terms: Optional[List[str]] = None) -> Optional[str]:
+        """Localiza uma coluna no DataFrame baseando-se em sinônimos normalizados com exclusões preventivas."""
         norm_cols = {col: cls.normalize_str(col) for col in df_columns}
         norm_synonyms = [cls.normalize_str(syn) for syn in synonyms]
+        norm_excludes = [cls.normalize_str(ex) for ex in (exclude_terms or [])]
+
+        def is_excluded(col_norm: str) -> bool:
+            return any(ex in col_norm for ex in norm_excludes)
 
         # 1. Match exato
         for orig, norm in norm_cols.items():
-            if norm in norm_synonyms:
+            if norm in norm_synonyms and not is_excluded(norm):
                 return orig
 
-        # 2. Match parcial (contém substring)
+        # 2. Match parcial (sinônimo contido no nome da coluna)
         for syn in norm_synonyms:
             for orig, norm in norm_cols.items():
-                if syn in norm or norm in syn:
+                if is_excluded(norm):
+                    continue
+                if syn in norm:
                     return orig
 
         return None
@@ -1028,34 +1098,58 @@ class DataProcessor:
         col_canal = cls.find_column(
             cols,
             [
-                "canal",
                 "canal de venda",
-                "canal da venda",
-                "plataforma",
                 "plataforma de venda",
-                "marketplace",
                 "nome da loja",
-                "loja",
-                "origem",
-                "origem da loja",
+                "loja de origem",
+                "tipo de canal",
+                "store name",
+                "shop name",
+                "plataforma",
+                "marketplace",
                 "platform",
+                "loja",
+                "canal",
                 "store",
                 "channel",
-                "tipo de canal",
+            ],
+            exclude_terms=[
+                "pedido",
+                "order",
+                "rastreio",
+                "rastreamento",
+                "pacote",
+                "package",
+                "armazem",
+                "armazém",
+                "numero",
+                "número",
+                "no.",
+                "codigo",
+                "código",
+                "id do pedido",
+                "id pedido",
+                "id_pedido",
+                "item",
+                "produto",
             ],
         )
 
         # Mapas de produtos para busca rápida O(1)
         prod_map_var = {}
         prod_map_sku = {}
+        prod_map_title = {}
         if not products_df.empty:
             for _, p in products_df.iterrows():
                 v_id = cls.clean_id_str(p["id_variante"])
                 s_val = cls.clean_id_str(p["sku"]).upper() if pd.notna(p["sku"]) else ""
+                n_val = cls.normalize_str(p["nome_anuncio"]) if pd.notna(p["nome_anuncio"]) else ""
                 if v_id:
                     prod_map_var[v_id] = p
                 if s_val:
                     prod_map_sku[s_val] = p
+                if n_val and n_val not in prod_map_title:
+                    prod_map_title[n_val] = p
 
         processed_sales = []
         unmapped_items = []
@@ -1092,16 +1186,33 @@ class DataProcessor:
                 tag_item = "Item Único"
                 pedido_id = raw_order_id
 
-            # Identificação do canal de cada linha (planilha unificada ou canal fixo)
+            # Identificação inteligente do canal de cada linha
+            row_canal = None
+
+            # 1. Tenta identificar canal pela coluna dedicada de canal/loja
             if col_canal and pd.notna(row[col_canal]) and str(row[col_canal]).strip():
-                row_canal = cls.normalize_channel(
-                    row[col_canal],
-                    default_channel=canal if canal not in ["Automático (Detectar pela Planilha Unificada)", "Automático", "Todos", ""] else "Shopee"
-                )
-            elif canal and canal not in ["Automático (Detectar pela Planilha Unificada)", "Automático", "Todos", ""]:
-                row_canal = canal
-            else:
-                row_canal = "Shopee"
+                row_canal = cls.detect_channel_from_string(row[col_canal])
+
+            # 2. Se não encontrou canal conhecido, varre outras colunas de texto procurando menção aos marketplaces
+            if not row_canal:
+                for c_col in cols:
+                    val_c = str(row[c_col]) if pd.notna(row[c_col]) else ""
+                    if val_c:
+                        det = cls.detect_channel_from_string(val_c)
+                        if det:
+                            row_canal = det
+                            break
+
+            # 3. Se ainda não encontrou, identifica pelo formato do número do pedido (ex: 261016Q... -> Shopee)
+            if not row_canal:
+                row_canal = cls.detect_channel_from_order_id(raw_order_id)
+
+            # 4. Fallback final seguro
+            if not row_canal:
+                if canal and canal not in ["Automático (Detectar pela Planilha Unificada)", "Automático", "Todos", ""]:
+                    row_canal = canal
+                else:
+                    row_canal = "Shopee"
 
             canais_contagem[row_canal] = canais_contagem.get(row_canal, 0) + 1
 
@@ -1126,7 +1237,7 @@ class DataProcessor:
 
             preco_up = cls.parse_currency(row[col_preco_up]) if col_preco_up else 0.0
 
-            # Algoritmo de Matching e Preço Base
+            # Algoritmo de Matching no Catálogo e Preço Base
             matched = False
             preco_base = 0.0
             custo_cmv = 0.0
@@ -1147,6 +1258,13 @@ class DataProcessor:
                 custo_cmv = float(p.get("custo_cmv", 0.0) or 0.0)
                 if not nome_anuncio or nome_anuncio == "Produto sem Nome":
                     nome_anuncio = str(p["nome_anuncio"])
+                matched = True
+
+            # 3. Fallback por Título do Anúncio
+            elif nome_anuncio and cls.normalize_str(nome_anuncio) in prod_map_title:
+                p = prod_map_title[cls.normalize_str(nome_anuncio)]
+                preco_base = float(p["preco_base"]) if float(p["preco_base"]) > 0 else float(p["preco_cheio"])
+                custo_cmv = float(p.get("custo_cmv", 0.0) or 0.0)
                 matched = True
 
             # 3. Fallback de Preço se não encontrado
