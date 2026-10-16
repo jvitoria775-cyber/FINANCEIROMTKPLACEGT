@@ -37,10 +37,6 @@ KNOWN_MARKETPLACES = [
     "TikTok Shop",
     "Shein",
     "Mercado Livre",
-    "Amazon",
-    "Magalu",
-    "Kwai Shop",
-    "Nuvemshop",
 ]
 
 DEFAULT_CHANNEL_RATES = {
@@ -72,16 +68,8 @@ class DatabaseManager:
 
     @classmethod
     def get_all_channels(cls) -> List[str]:
-        """Retorna todos os canais cadastrados no banco ou predefinidos, filtrando apenas marketplaces válidos."""
-        with cls.get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT canal FROM configuracoes_canais")
-            db_channels = [
-                row["canal"] for row in cursor.fetchall()
-                if row["canal"] and row["canal"] in KNOWN_MARKETPLACES
-            ]
-            all_c = list(dict.fromkeys(CHANNELS + db_channels))
-            return all_c
+        """Retorna estritamente os 4 canais oficiais do sistema."""
+        return list(CHANNELS)
 
     @staticmethod
     def get_connection() -> sqlite3.Connection:
@@ -384,24 +372,6 @@ class DatabaseManager:
 
         with cls.get_connection() as conn:
             cursor = conn.cursor()
-
-            # Garante que qualquer canal detectado na planilha conste em configuracoes_canais (apenas marketplaces válidos)
-            for s in sales:
-                ch = s.get("canal")
-                if ch and ch in KNOWN_MARKETPLACES:
-                    cursor.execute("SELECT canal FROM configuracoes_canais WHERE canal = ?", (ch,))
-                    if not cursor.fetchone():
-                        def_rate = DEFAULT_CHANNEL_RATES.get(
-                            ch,
-                            {"taxa_comissao_pct": 20.0, "taxa_fixa_unidade": 5.0, "aliquota_imposto_pct": 8.0},
-                        )
-                        cursor.execute(
-                            """
-                            INSERT INTO configuracoes_canais (canal, taxa_comissao_pct, taxa_fixa_unidade, aliquota_imposto_pct)
-                            VALUES (?, ?, ?, ?)
-                            """,
-                            (ch, def_rate["taxa_comissao_pct"], def_rate["taxa_fixa_unidade"], def_rate["aliquota_imposto_pct"]),
-                        )
 
             for s in sales:
                 pid = str(s["pedido_id"])
@@ -1098,22 +1068,20 @@ class DataProcessor:
         col_canal = cls.find_column(
             cols,
             [
-                "canal de venda",
-                "plataforma de venda",
-                "nome da loja",
-                "loja de origem",
-                "tipo de canal",
-                "store name",
-                "shop name",
                 "plataforma",
+                "canal de venda",
+                "canal",
                 "marketplace",
                 "platform",
-                "loja",
-                "canal",
-                "store",
                 "channel",
+                "nome da loja no upseller",
+                "nome da loja",
+                "loja",
+                "store name",
+                "shop name",
             ],
             exclude_terms=[
+                "origem",
                 "pedido",
                 "order",
                 "rastreio",
@@ -1132,6 +1100,11 @@ class DataProcessor:
                 "id_pedido",
                 "item",
                 "produto",
+                "ncm",
+                "imposto",
+                "unidade",
+                "link",
+                "imagem",
             ],
         )
 
@@ -1142,10 +1115,14 @@ class DataProcessor:
         if not products_df.empty:
             for _, p in products_df.iterrows():
                 v_id = cls.clean_id_str(p["id_variante"])
+                raw_vid = str(p["id_variante"]).strip() if pd.notna(p["id_variante"]) else ""
                 s_val = cls.clean_id_str(p["sku"]).upper() if pd.notna(p["sku"]) else ""
                 n_val = cls.normalize_str(p["nome_anuncio"]) if pd.notna(p["nome_anuncio"]) else ""
                 if v_id:
                     prod_map_var[v_id] = p
+                    prod_map_var[v_id + ".0"] = p
+                if raw_vid:
+                    prod_map_var[raw_vid] = p
                 if s_val:
                     prod_map_sku[s_val] = p
                 if n_val and n_val not in prod_map_title:
@@ -1189,13 +1166,23 @@ class DataProcessor:
             # Identificação inteligente do canal de cada linha
             row_canal = None
 
-            # 1. Tenta identificar canal pela coluna dedicada de canal/loja
+            # 1. Tenta identificar canal pela coluna dedicada de canal/loja (ex: coluna 'Plataforma')
             if col_canal and pd.notna(row[col_canal]) and str(row[col_canal]).strip():
                 row_canal = cls.detect_channel_from_string(row[col_canal])
 
-            # 2. Se não encontrou canal conhecido, varre outras colunas de texto procurando menção aos marketplaces
+            # 2. Se ainda não encontrou, identifica pelo formato do número do pedido (ex: 261016Q... -> Shopee)
             if not row_canal:
+                row_canal = cls.detect_channel_from_order_id(raw_order_id)
+
+            # 3. Se não encontrou, varre outras colunas de metadados de loja/plataforma (evitando colunas de produto/anúncio)
+            if not row_canal:
+                ignore_cols = {col_nome, col_var_id, col_order_id, col_sku, col_preco_up, col_data_pedido, col_qtd}
                 for c_col in cols:
+                    if c_col in ignore_cols:
+                        continue
+                    c_col_lower = cls.normalize_str(c_col)
+                    if any(term in c_col_lower for term in ["origem", "ncm", "imposto", "rastreio", "pacote", "codigo"]):
+                        continue
                     val_c = str(row[c_col]) if pd.notna(row[c_col]) else ""
                     if val_c:
                         det = cls.detect_channel_from_string(val_c)
@@ -1203,16 +1190,16 @@ class DataProcessor:
                             row_canal = det
                             break
 
-            # 3. Se ainda não encontrou, identifica pelo formato do número do pedido (ex: 261016Q... -> Shopee)
-            if not row_canal:
-                row_canal = cls.detect_channel_from_order_id(raw_order_id)
-
             # 4. Fallback final seguro
             if not row_canal:
-                if canal and canal not in ["Automático (Detectar pela Planilha Unificada)", "Automático", "Todos", ""]:
+                if canal and canal in CHANNELS:
                     row_canal = canal
                 else:
                     row_canal = "Shopee"
+
+            # Garantia estrita: row_canal DEVE ser um dos 4 canais suportados
+            if row_canal not in CHANNELS:
+                row_canal = "Shopee"
 
             canais_contagem[row_canal] = canais_contagem.get(row_canal, 0) + 1
 
@@ -1242,9 +1229,16 @@ class DataProcessor:
             preco_base = 0.0
             custo_cmv = 0.0
 
-            # 1. Busca por id_variante
+            # 1. Busca por id_variante (com suporte a variantes limpas ou com .0)
             if id_var and id_var in prod_map_var:
                 p = prod_map_var[id_var]
+                preco_base = float(p["preco_base"]) if float(p["preco_base"]) > 0 else float(p["preco_cheio"])
+                custo_cmv = float(p.get("custo_cmv", 0.0) or 0.0)
+                if not nome_anuncio or nome_anuncio == "Produto sem Nome":
+                    nome_anuncio = str(p["nome_anuncio"])
+                matched = True
+            elif id_var and (id_var + ".0") in prod_map_var:
+                p = prod_map_var[id_var + ".0"]
                 preco_base = float(p["preco_base"]) if float(p["preco_base"]) > 0 else float(p["preco_cheio"])
                 custo_cmv = float(p.get("custo_cmv", 0.0) or 0.0)
                 if not nome_anuncio or nome_anuncio == "Produto sem Nome":

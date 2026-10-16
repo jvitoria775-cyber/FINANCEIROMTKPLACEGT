@@ -392,6 +392,98 @@ def run_tests():
     assert "261016Q8536637" not in all_channels_after, "Número de pedido poluiu lista de canais!"
     print("✅ 13. Reconhecimento automático de pedidos Shopee sem poluição de canais e cálculo de saque validados com sucesso.")
 
+    # 14. Teste com o Formato Exato da Planilha UpSeller (Colunas: Plataforma, Origem*, etc.)
+    upseller_export_df = pd.DataFrame([
+        {
+            "Nº de Pedido da Plataforma": "261016Q8536637",
+            "Nº do Pedido": "UFWTG296162",
+            "Plataforma": "Shopee",
+            "Nome da loja no UpSeller": "BY HOPE",
+            "Nome do Anúncio": "Camisa Polo Algodão Premium",
+            "SKU": "CAMISA-PRETA-G",
+            "ID da Variante": "VAR_SHP_001.0",  # Testando ID com float/decimal .0 vindo do Excel
+            "Preço do Produto": 59.90,  # Preço com desconto pago pelo cliente no marketplace
+            "Qtd. do Produto": 1,
+            "Origem*": "0 - Nacional, exceto as indicadas nos códigos 3 a 5",
+        },
+        {
+            "Nº de Pedido da Plataforma": "586812345678901234",
+            "Nº do Pedido": "UFWTG296163",
+            "Plataforma": "TikTok Shop",
+            "Nome da loja no UpSeller": "Jc Shoop",
+            "Nome do Anúncio": "Vestido Midi Floral",
+            "SKU": "VESTIDO-FLORAL-M",
+            "ID da Variante": "VAR_TT_002",
+            "Preço do Produto": 89.90,
+            "Qtd. do Produto": 1,
+            "Origem*": "0 - Nacional, exceto as indicadas nos códigos 3 a 5",
+        },
+        {
+            "Nº de Pedido da Plataforma": "GSO1234567890",
+            "Nº do Pedido": "UFWTG296164",
+            "Plataforma": "Shein",
+            "Nome da loja no UpSeller": "J&C Shein",
+            "Nome do Anúncio": "Camisa Polo Algodão Premium",
+            "SKU": "CAMISA-PRETA-G",
+            "ID da Variante": "VAR_SHP_001",
+            "Preço do Produto": 65.00,
+            "Qtd. do Produto": 1,
+            "Origem*": "0 - Nacional, exceto as indicadas nos códigos 3 a 5",
+        },
+        {
+            "Nº de Pedido da Plataforma": "20000087654321",
+            "Nº do Pedido": "UFWTG296165",
+            "Plataforma": "Mercado Livre",
+            "Nome da loja no UpSeller": "Gratitude ML",
+            "Nome do Anúncio": "Vestido Midi Floral",
+            "SKU": "VESTIDO-FLORAL-M",
+            "ID da Variante": "VAR_TT_002.0",
+            "Preço do Produto": 110.00,
+            "Qtd. do Produto": 1,
+            "Origem*": "0 - Nacional, exceto as indicadas nos códigos 3 a 5",
+        },
+    ])
+
+    processed_up, stats_up = DataProcessor.reconcile_sales_batch(
+        df_sales=upseller_export_df,
+        canal="Automático (Detectar pela Planilha Unificada)",
+        channel_configs=current_configs,
+        products_df=prods_df,
+    )
+
+    # Verifica canais identificados diretamente pela coluna 'Plataforma'
+    assert len(processed_up) == 4
+    assert processed_up[0]["canal"] == "Shopee"
+    assert processed_up[1]["canal"] == "TikTok Shop"
+    assert processed_up[2]["canal"] == "Shein"
+    assert processed_up[3]["canal"] == "Mercado Livre"
+
+    # Nenhum bloco espúrio de canal criado
+    assert "0 - Nacional, exceto as indicadas nos códigos 3 a 5" not in stats_up["canais_detectados"]
+    assert "261016Q8536637" not in stats_up["canais_detectados"]
+
+    # Verifica recuperação do preço base do catálogo (105.00 e 150.00) mesmo com .0
+    assert processed_up[0]["preco_base_anuncio"] == 105.00
+    assert processed_up[1]["preco_base_anuncio"] == 150.00
+    assert processed_up[2]["preco_base_anuncio"] == 105.00
+    assert processed_up[3]["preco_base_anuncio"] == 150.00
+
+    # Verifica cálculos de saque líquido exatos:
+    # 1. Shopee: 105.00 - Com(18% = 18.90) - Fixa(5.00) - Imp(8% = 8.40) = 72.70
+    assert processed_up[0]["saque_liquido_previsto"] == 72.70
+    # 2. TikTok Shop: 150.00 - Com(22% = 33.00) - Fixa(5.00) - Imp(8% = 12.00) = 100.00
+    assert processed_up[1]["saque_liquido_previsto"] == 100.00
+    # 3. Shein: 105.00 - Com(20% = 21.00) - Fixa(4.00) - Imp(8% = 8.40) = 71.60
+    assert processed_up[2]["saque_liquido_previsto"] == 71.60
+    # 4. Mercado Livre: 150.00 - Com(19% = 28.50) - Fixa(6.00) - Imp(8% = 12.00) = 103.50
+    assert processed_up[3]["saque_liquido_previsto"] == 103.50
+
+    # Inserção no banco e garantia estrita de apenas 4 canais
+    DatabaseManager.upsert_sales(processed_up)
+    final_channels = DatabaseManager.get_all_channels()
+    assert final_channels == ["Shopee", "TikTok Shop", "Shein", "Mercado Livre"], f"Canais divergentes: {final_channels}"
+    print("✅ 14. Validação completa do formato UpSeller com coluna 'Plataforma', exclusão de 'Origem*' e cálculo de saque com 100% de precisão.")
+
     print("=" * 60)
     print("TODOS OS TESTES PASSARAM COM SUCESSO! 🎉")
     print("=" * 60)
