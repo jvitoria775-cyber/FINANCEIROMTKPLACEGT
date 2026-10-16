@@ -583,6 +583,17 @@ class DatabaseManager:
             return recalculated_count
 
     @classmethod
+    def clear_sales_history(cls) -> int:
+        """Limpa todo o histórico de vendas processadas, preservando os anúncios e configurações de taxas."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM vendas_processadas")
+            count = cursor.fetchone()[0]
+            cursor.execute("DELETE FROM vendas_processadas")
+            conn.commit()
+            return count
+
+    @classmethod
     def get_summary_metrics(cls) -> Dict[str, Any]:
         """Calcula agregados rápidos para os badges do sistema."""
         with cls.get_connection() as conn:
@@ -2420,6 +2431,23 @@ def main():
                     recalc_count = DatabaseManager.recalculate_all_sales()
                     st.balloons()
                     st.success(f"🎉 Recálculo concluído! **{recalc_count} vendas** foram recalculadas com as taxas e CMVs atualizados.")
+
+        st.divider()
+
+        # PARTE 3: Manutenção do Sistema & Reinício do Histórico
+        st.markdown("#### 3. Manutenção e Reinício do Histórico de Vendas")
+        st.caption("Esta opção zera exclusivamente os pedidos e faturamento da aba de vendas. Seus anúncios cadastrados no catálogo e as taxas configuradas permanecem 100% intactos.")
+
+        with st.expander("🗑️ Zona de Limpeza: Zerar Vendas Processadas", expanded=False):
+            st.warning("⚠️ **Atenção:** Esta ação apagará todas as vendas gravadas no banco de dados para que você possa iniciar o controle financeiro do zero com as novas planilhas.")
+            chk_confirma_zerar = st.checkbox(
+                "Sim, confirmo que desejo apagar todo o histórico de vendas para começar do zero.",
+                key="chk_confirma_zerar",
+            )
+            if st.button("🚨 Confirmar e Apagar Todas as Vendas", type="primary", key="btn_zerar_vendas", disabled=not chk_confirma_zerar):
+                qtd_removidas = DatabaseManager.clear_sales_history()
+                st.success(f"✅ Histórico financeiro zerado com sucesso! **{qtd_removidas} vendas** foram removidas. O catálogo de anúncios continua 100% preservado.")
+                st.rerun()
 
 
 if __name__ == "__main__":

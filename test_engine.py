@@ -1,11 +1,21 @@
 import os
 import sys
 import sqlite3
+from pathlib import Path
 import pandas as pd
 
 if sys.stdout.encoding != 'utf-8':
     sys.stdout.reconfigure(encoding='utf-8')
+import app
 from app import DatabaseManager, DataProcessor, ExcelExporter, DEFAULT_CHANNEL_RATES
+
+TEST_DB = Path("test_engine.db")
+if TEST_DB.exists():
+    try:
+        TEST_DB.unlink()
+    except Exception:
+        pass
+app.DB_PATH = TEST_DB
 
 
 def run_tests():
@@ -15,7 +25,7 @@ def run_tests():
 
     # 1. Teste de Inicialização do Banco
     DatabaseManager.init_db()
-    assert os.path.exists("ecommerce_financeiro.db"), "Banco SQLite não foi criado!"
+    assert os.path.exists("test_engine.db"), "Banco SQLite de teste não foi criado!"
     print("✅ 1. Banco SQLite inicializado com sucesso.")
 
     # 2. Teste de Taxas Padrão
@@ -337,6 +347,12 @@ def run_tests():
     print("=" * 60)
     print("TODOS OS TESTES PASSARAM COM SUCESSO! 🎉")
     print("=" * 60)
+
+    if TEST_DB.exists():
+        try:
+            TEST_DB.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

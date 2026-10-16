@@ -13,6 +13,8 @@ __pycache__/
 
 # Banco de dados local (gerado automaticamente pelo app.py no primeiro boot)
 *.db-journal
+*backup*.db
+test_engine.db
 
 # Logs e arquivos temporários do sistema
 *.log
