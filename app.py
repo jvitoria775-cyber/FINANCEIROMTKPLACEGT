@@ -119,6 +119,8 @@ class DatabaseManager:
                 """
                 CREATE TABLE IF NOT EXISTS vendas_processadas (
                     pedido_id TEXT PRIMARY KEY,
+                    numero_venda TEXT,
+                    tag_item TEXT,
                     canal TEXT NOT NULL,
                     id_variante TEXT,
                     sku TEXT,
@@ -137,11 +139,23 @@ class DatabaseManager:
                 )
                 """
             )
-            # Migração automática caso a tabela já exista sem a coluna data_pedido
+            # Migrações automáticas caso a tabela já exista
             try:
                 cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN data_pedido TEXT")
             except sqlite3.OperationalError:
                 pass
+            try:
+                cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN numero_venda TEXT")
+            except sqlite3.OperationalError:
+                pass
+            try:
+                cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN tag_item TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+            # Backfill para registros legados
+            cursor.execute("UPDATE vendas_processadas SET numero_venda = pedido_id WHERE numero_venda IS NULL OR numero_venda = ''")
+            cursor.execute("UPDATE vendas_processadas SET tag_item = 'Item Único' WHERE tag_item IS NULL OR tag_item = ''")
             conn.commit()
 
     @classmethod
@@ -332,13 +346,15 @@ class DatabaseManager:
                 cursor.execute(
                     """
                     INSERT INTO vendas_processadas (
-                        pedido_id, canal, id_variante, sku, nome_anuncio,
+                        pedido_id, numero_venda, tag_item, canal, id_variante, sku, nome_anuncio,
                         quantidade, preco_upseller_registrado, preco_base_anuncio,
                         faturamento_bruto, total_taxas_canal, valor_imposto,
                         saque_liquido_previsto, custo_cmv_total, lucro_liquido_real,
                         data_pedido, data_processamento
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(pedido_id) DO UPDATE SET
+                        numero_venda = excluded.numero_venda,
+                        tag_item = excluded.tag_item,
                         canal = excluded.canal,
                         id_variante = excluded.id_variante,
                         sku = excluded.sku,
@@ -357,6 +373,8 @@ class DatabaseManager:
                     """,
                     (
                         str(s["pedido_id"]),
+                        str(s.get("numero_venda") or s["pedido_id"]),
+                        str(s.get("tag_item") or "Item Único"),
                         s.get("canal", ""),
                         s.get("id_variante", ""),
                         s.get("sku", ""),
@@ -514,6 +532,16 @@ class DatabaseManager:
 # =============================================================================
 class DataProcessor:
     """Funções utilitárias para higienização, mapeamento flexível e cálculos."""
+
+    @staticmethod
+    def clean_id_str(val: Any) -> str:
+        """Limpa IDs alfanuméricos e numéricos, removendo .0 de inteiros vindos do Excel."""
+        if val is None or pd.isna(val):
+            return ""
+        s = str(val).strip()
+        if s.endswith(".0"):
+            s = s[:-2]
+        return s
 
     @staticmethod
     def normalize_str(val: Any) -> str:
@@ -712,9 +740,9 @@ class DataProcessor:
 
         records = []
         for idx, row in df.iterrows():
-            id_variante = str(row[col_var_id]).strip() if col_var_id and pd.notna(row[col_var_id]) else ""
-            sku_val = str(row[col_sku]).strip() if col_sku and pd.notna(row[col_sku]) else ""
-            id_anuncio = str(row[col_item_id]).strip() if col_item_id and pd.notna(row[col_item_id]) else ""
+            id_variante = cls.clean_id_str(row[col_var_id]) if col_var_id and pd.notna(row[col_var_id]) else ""
+            sku_val = cls.clean_id_str(row[col_sku]) if col_sku and pd.notna(row[col_sku]) else ""
+            id_anuncio = cls.clean_id_str(row[col_item_id]) if col_item_id and pd.notna(row[col_item_id]) else ""
             nome = str(row[col_nome]).strip() if col_nome and pd.notna(row[col_nome]) else "Anúncio sem Nome"
             variacao = str(row[col_var_nome]).strip() if col_var_nome and pd.notna(row[col_var_nome]) else ""
 
@@ -768,14 +796,41 @@ class DataProcessor:
         col_order_id = cls.find_column(
             cols,
             [
+                "numero da venda",
+                "número da venda",
+                "numero de venda",
+                "número de venda",
+                "id da venda",
+                "id de venda",
+                "codigo da venda",
+                "código da venda",
                 "numero do pedido",
                 "número do pedido",
+                "numero de pedido",
+                "número de pedido",
                 "id do pedido",
+                "id de pedido",
+                "codigo do pedido",
+                "código do pedido",
+                "no. do pedido",
+                "no. de pedido",
+                "nº do pedido",
+                "nº de pedido",
+                "n° do pedido",
+                "n° de pedido",
+                "pedido id",
+                "venda id",
                 "order id",
                 "order no",
-                "pedido id",
-                "nº do pedido",
+                "order sn",
+                "order number",
+                "encomenda",
+                "id da encomenda",
+                "número da encomenda",
+                "numero da encomenda",
                 "pedido_id",
+                "pedido",
+                "venda",
             ],
         )
 
@@ -871,8 +926,8 @@ class DataProcessor:
         prod_map_sku = {}
         if not products_df.empty:
             for _, p in products_df.iterrows():
-                v_id = str(p["id_variante"]).strip()
-                s_val = str(p["sku"]).strip().upper() if pd.notna(p["sku"]) else ""
+                v_id = cls.clean_id_str(p["id_variante"])
+                s_val = cls.clean_id_str(p["sku"]).upper() if pd.notna(p["sku"]) else ""
                 if v_id:
                     prod_map_var[v_id] = p
                 if s_val:
@@ -882,21 +937,38 @@ class DataProcessor:
         unmapped_items = []
         seen_order_ids: Dict[str, int] = {}
 
+        # Contagem prévia de quantas linhas cada venda/pedido possui no lote
+        order_counts: Dict[str, int] = {}
+        for idx, row in df_sales.iterrows():
+            if col_order_id and pd.notna(row[col_order_id]):
+                raw_oid = cls.clean_id_str(row[col_order_id])
+            else:
+                raw_oid = f"VENDA_{idx+1}"
+            order_counts[raw_oid] = order_counts.get(raw_oid, 0) + 1
+
         total_itens = len(df_sales)
         matched_count = 0
 
         for idx, row in df_sales.iterrows():
-            raw_order_id = str(row[col_order_id]).strip() if col_order_id and pd.notna(row[col_order_id]) else f"PED_{idx+1}"
-            
-            # Garantir idempotência mesmo em pedidos multilinhas (ex: carrinho com 2 peças)
-            seen_order_ids[raw_order_id] = seen_order_ids.get(raw_order_id, 0) + 1
-            if seen_order_ids[raw_order_id] > 1:
-                pedido_id = f"{raw_order_id}_{seen_order_ids[raw_order_id]}"
+            if col_order_id and pd.notna(row[col_order_id]):
+                raw_order_id = cls.clean_id_str(row[col_order_id])
             else:
+                raw_order_id = f"VENDA_{idx+1}"
+
+            total_itens_venda = order_counts.get(raw_order_id, 1)
+            current_item_index = seen_order_ids.get(raw_order_id, 0) + 1
+            seen_order_ids[raw_order_id] = current_item_index
+
+            # Taggear o número da venda para que ela não se repita de forma ambígua
+            if total_itens_venda > 1:
+                tag_item = f"Item {current_item_index} de {total_itens_venda}"
+                pedido_id = f"{raw_order_id}-{current_item_index:02d}"
+            else:
+                tag_item = "Item Único"
                 pedido_id = raw_order_id
 
-            id_var = str(row[col_var_id]).strip() if col_var_id and pd.notna(row[col_var_id]) else ""
-            sku_val = str(row[col_sku]).strip() if col_sku and pd.notna(row[col_sku]) else ""
+            id_var = cls.clean_id_str(row[col_var_id]) if col_var_id and pd.notna(row[col_var_id]) else ""
+            sku_val = cls.clean_id_str(row[col_sku]) if col_sku and pd.notna(row[col_sku]) else ""
             nome_anuncio = str(row[col_nome]).strip() if col_nome and pd.notna(row[col_nome]) else "Produto sem Nome"
 
             try:
@@ -934,7 +1006,7 @@ class DataProcessor:
             if not matched:
                 preco_base = preco_up
                 custo_cmv = 0.0
-                unmapped_items.append({"pedido": pedido_id, "sku": sku_val, "variante": id_var, "preco_usado": preco_up})
+                unmapped_items.append({"pedido": pedido_id, "numero_venda": raw_order_id, "sku": sku_val, "variante": id_var, "preco_usado": preco_up})
             else:
                 matched_count += 1
 
@@ -959,6 +1031,8 @@ class DataProcessor:
             processed_sales.append(
                 {
                     "pedido_id": pedido_id,
+                    "numero_venda": raw_order_id,
+                    "tag_item": tag_item,
                     "canal": canal,
                     "id_variante": id_var,
                     "sku": sku_val,
@@ -1015,7 +1089,9 @@ class ExcelExporter:
 
         # Mapeamento e Ordem de Colunas Amigáveis
         col_labels = [
-            ("pedido_id", "ID do Pedido", "@"),
+            ("numero_venda", "Nº da Venda", "@"),
+            ("tag_item", "Tag / Linha", "@"),
+            ("pedido_id", "ID Linha", "@"),
             ("data_pedido", "Data do Pedido", "@"),
             ("canal", "Canal / Marketplace", "@"),
             ("sku", "SKU", "@"),
@@ -1700,8 +1776,12 @@ def main():
             # Aplicação do filtro de busca textual
             if filtro_busca:
                 b_norm = DataProcessor.normalize_str(filtro_busca)
+                num_venda_col = df_sales["numero_venda"].astype(str).str.lower() if "numero_venda" in df_sales.columns else pd.Series(dtype=str)
+                tag_item_col = df_sales["tag_item"].astype(str).str.lower() if "tag_item" in df_sales.columns else pd.Series(dtype=str)
                 df_sales = df_sales[
                     df_sales["pedido_id"].astype(str).str.lower().str.contains(b_norm)
+                    | num_venda_col.str.contains(b_norm)
+                    | tag_item_col.str.contains(b_norm)
                     | df_sales["sku"].astype(str).str.lower().str.contains(b_norm)
                     | df_sales["nome_anuncio"].astype(str).str.lower().str.contains(b_norm)
                 ]
@@ -1831,7 +1911,9 @@ def main():
                 df_display[c] = df_display[c].apply(format_currency_br)
 
             col_renames = {
-                "pedido_id": "Pedido ID",
+                "numero_venda": "Nº da Venda",
+                "tag_item": "Tag / Linha",
+                "pedido_id": "ID Linha",
                 "data_pedido": "Data do Pedido",
                 "canal": "Canal",
                 "sku": "SKU",
@@ -1926,6 +2008,7 @@ def main():
                     | df_prods_filtered["nome_anuncio"].astype(str).str.lower().str.contains(b_norm)
                 ]
 
+            df_prods_filtered["id_variante"] = df_prods_filtered["id_variante"].apply(DataProcessor.clean_id_str)
             st.write(f"Exibindo **{len(df_prods_filtered)}** produtos.")
             st.dataframe(
                 df_prods_filtered[[
@@ -1980,7 +2063,7 @@ def main():
                         f"""
                         <div style="background: white; border: 1px solid #e2e8f0; border-radius: 8px; padding: 15px; margin-bottom: 12px;">
                             <b>Resumo da Conciliação do Lote:</b><br/>
-                            • Total de Pedidos/Linhas: <b>{stats['total_pedidos']}</b><br/>
+                            • Total de Linhas/Itens: <b>{stats['total_pedidos']}</b><br/>
                             • Itens Vinculados ao Catálogo de Anúncios: <b>{stats['itens_conciliados']}</b> ({stats['taxa_cobertura_pct']}% de cobertura)<br/>
                             • Itens sem Anúncio Pré-Cadastrado: <b>{stats['itens_nao_cadastrados']}</b> (utilizado preço de venda como fallback)<br/>
                         </div>
@@ -1997,14 +2080,31 @@ def main():
 
                     # Prévia dos dados conciliados
                     df_preview_conciliado = pd.DataFrame(processed_sales)
+                    cols_preview = [
+                        c for c in [
+                            "numero_venda", "tag_item", "pedido_id", "sku", "nome_anuncio", "quantidade",
+                            "preco_upseller_registrado", "preco_base_anuncio",
+                            "faturamento_bruto", "total_taxas_canal", "valor_imposto",
+                            "saque_liquido_previsto", "lucro_liquido_real"
+                        ] if c in df_preview_conciliado.columns
+                    ]
                     with st.expander("👀 Ver prévia detalhada dos cálculos do lote", expanded=True):
                         st.dataframe(
-                            df_preview_conciliado[[
-                                "pedido_id", "sku", "nome_anuncio", "quantidade",
-                                "preco_upseller_registrado", "preco_base_anuncio",
-                                "faturamento_bruto", "total_taxas_canal", "valor_imposto",
-                                "saque_liquido_previsto", "lucro_liquido_real"
-                            ]].head(10),
+                            df_preview_conciliado[cols_preview].rename(columns={
+                                "numero_venda": "Nº da Venda",
+                                "tag_item": "Tag / Linha",
+                                "pedido_id": "ID Linha",
+                                "sku": "SKU",
+                                "nome_anuncio": "Nome do Anúncio",
+                                "quantidade": "Qtd",
+                                "preco_upseller_registrado": "Preço UpSeller",
+                                "preco_base_anuncio": "Preço Base",
+                                "faturamento_bruto": "Fat. Bruto",
+                                "total_taxas_canal": "Taxas Canal",
+                                "valor_imposto": "Imposto DAS",
+                                "saque_liquido_previsto": "Saque Previsto",
+                                "lucro_liquido_real": "Lucro Real",
+                            }).head(15),
                             use_container_width=True,
                             hide_index=True,
                         )
@@ -2103,6 +2203,7 @@ def main():
             st.info("Nenhum produto cadastrado no catálogo para gerenciar CMV. Cadastre anúncios na aba 'Importação de Anúncios'.")
         else:
             df_editor = df_prods_cmv[["id_variante", "sku", "nome_anuncio", "canal", "preco_base", "custo_cmv"]].copy()
+            df_editor["id_variante"] = df_editor["id_variante"].apply(DataProcessor.clean_id_str)
 
             edited_df = st.data_editor(
                 df_editor,

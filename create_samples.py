@@ -78,12 +78,28 @@ vendas_data = [
         "Preço de Produto": "R$ 119,90",  # Cupom TikTok Shop de R$ 30,00!
     },
     {
-        "Número do Pedido": "241006J1K2L3",
+        "Número da Venda": "241006J1K2L3",
         "ID da Variante": "VAR_SHN_301",
         "SKU": "VESTIDO-VERAO-P",
         "Nome do Produto": "Vestido Floral Alça Fina Verão",
         "Quantidade": 3,
         "Preço de Produto": "R$ 55,00",  # Cupom Shein!
+    },
+    {
+        "Número da Venda": "241006MULTI_99",
+        "ID da Variante": "VAR_SHP_101",
+        "SKU": "POLO-AZUL-M",
+        "Nome do Produto": "Camisa Polo Algodão Pima Confort",
+        "Quantidade": 1,
+        "Preço de Produto": "R$ 85,00",
+    },
+    {
+        "Número da Venda": "241006MULTI_99",  # Segunda linha da mesma venda
+        "ID da Variante": "VAR_SHP_102",
+        "SKU": "POLO-PRETA-G",
+        "Nome do Produto": "Camisa Polo Algodão Pima Confort",
+        "Quantidade": 1,
+        "Preço de Produto": "R$ 89,90",
     },
 ]
 

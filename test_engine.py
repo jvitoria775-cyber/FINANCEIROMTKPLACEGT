@@ -179,6 +179,74 @@ def run_tests():
     assert "2026-10-06" in dt_val, f"Falha no parsing de data BR: {dt_val}"
     print("✅ 10. Parsing de datas e persistência de data_pedido validados.")
 
+    # 9. Teste de Taggear Número da Venda em Pedidos Multilinhas (e detecção de "Número da Venda")
+    multi_sales_df = pd.DataFrame([
+        {
+            "Número da Venda": "VENDA_MULTILINHA_888",
+            "ID da Variante": "VAR_SHP_001",
+            "SKU": "CAMISA-PRETA-G",
+            "Nome do Produto": "Camisa Polo Algodão",
+            "Quantidade": 1,
+            "Preço de Produto": 80.00,
+        },
+        {
+            "Número da Venda": "VENDA_MULTILINHA_888",  # Segunda linha da mesma venda
+            "ID da Variante": "VAR_TT_002",
+            "SKU": "VESTIDO-FLORAL-M",
+            "Nome do Produto": "Vestido Midi Floral",
+            "Quantidade": 1,
+            "Preço de Produto": 110.00,
+        },
+        {
+            "Número da Venda": "VENDA_UNICA_999",  # Venda de item único
+            "ID da Variante": "VAR_SHP_001",
+            "SKU": "CAMISA-PRETA-G",
+            "Nome do Produto": "Camisa Polo Algodão",
+            "Quantidade": 1,
+            "Preço de Produto": 80.00,
+        },
+    ])
+
+    processed_multisales, stats_multi = DataProcessor.reconcile_sales_batch(
+        df_sales=multi_sales_df,
+        canal="Shopee",
+        channel_configs=configs,
+        products_df=prods_df,
+    )
+
+    assert len(processed_multisales) == 3, "Deveriam ter 3 linhas processadas"
+    
+    # Valida linha 1 da venda multilinhas
+    l1 = processed_multisales[0]
+    assert l1["numero_venda"] == "VENDA_MULTILINHA_888", f"Número da venda incorreto: {l1['numero_venda']}"
+    assert l1["tag_item"] == "Item 1 de 2", f"Tag do item incorreta: {l1['tag_item']}"
+    assert l1["pedido_id"] == "VENDA_MULTILINHA_888-01", f"ID taggeado incorreto: {l1['pedido_id']}"
+
+    # Valida linha 2 da venda multilinhas
+    l2 = processed_multisales[1]
+    assert l2["numero_venda"] == "VENDA_MULTILINHA_888", f"Número da venda incorreto: {l2['numero_venda']}"
+    assert l2["tag_item"] == "Item 2 de 2", f"Tag do item incorreta: {l2['tag_item']}"
+    assert l2["pedido_id"] == "VENDA_MULTILINHA_888-02", f"ID taggeado incorreto: {l2['pedido_id']}"
+
+    # Valida venda de item único
+    l3 = processed_multisales[2]
+    assert l3["numero_venda"] == "VENDA_UNICA_999", f"Número da venda incorreto: {l3['numero_venda']}"
+    assert l3["tag_item"] == "Item Único", f"Tag do item incorreta: {l3['tag_item']}"
+    assert l3["pedido_id"] == "VENDA_UNICA_999", f"ID de item único incorreto: {l3['pedido_id']}"
+
+    # Gravar no banco e verificar persistência
+    DatabaseManager.upsert_sales(processed_multisales)
+    df_db_check = DatabaseManager.get_sales_dataframe()
+    row_l1 = df_db_check[df_db_check["pedido_id"] == "VENDA_MULTILINHA_888-01"].iloc[0]
+    assert row_l1["numero_venda"] == "VENDA_MULTILINHA_888"
+    assert row_l1["tag_item"] == "Item 1 de 2"
+
+    # Reimportar exatamente o mesmo lote para testar prevenção de duplicação
+    novas_reimp, atus_reimp = DatabaseManager.upsert_sales(processed_multisales)
+    assert novas_reimp == 0, "Reimportação não deveria criar novas vendas"
+    assert atus_reimp == 3, "Deveria ter atualizado as 3 vendas existentes sem duplicar"
+    print("✅ 11. Taggeamento de pedidos multilinhas e prevenção de duplicações validados com sucesso.")
+
     print("=" * 60)
     print("TODOS OS TESTES PASSARAM COM SUCESSO! 🎉")
     print("=" * 60)
