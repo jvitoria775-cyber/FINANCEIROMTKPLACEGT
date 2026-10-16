@@ -30,7 +30,7 @@ import streamlit as st
 # =============================================================================
 DB_PATH = Path("ecommerce_financeiro.db")
 
-CHANNELS = ["Shopee", "TikTok Shop", "Shein"]
+CHANNELS = ["Shopee", "TikTok Shop", "Shein", "Mercado Livre"]
 
 DEFAULT_CHANNEL_RATES = {
     "Shopee": {
@@ -48,11 +48,26 @@ DEFAULT_CHANNEL_RATES = {
         "taxa_fixa_unidade": 4.00,
         "aliquota_imposto_pct": 8.0,
     },
+    "Mercado Livre": {
+        "taxa_comissao_pct": 19.0,
+        "taxa_fixa_unidade": 6.00,
+        "aliquota_imposto_pct": 8.0,
+    },
 }
 
 
 class DatabaseManager:
     """Gerenciador central do banco de dados relacional SQLite."""
+
+    @classmethod
+    def get_all_channels(cls) -> List[str]:
+        """Retorna todos os canais cadastrados no banco ou predefinidos."""
+        with cls.get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT DISTINCT canal FROM configuracoes_canais")
+            db_channels = [row["canal"] for row in cursor.fetchall() if row["canal"]]
+            all_c = list(dict.fromkeys(CHANNELS + db_channels))
+            return all_c
 
     @staticmethod
     def get_connection() -> sqlite3.Connection:
@@ -341,6 +356,25 @@ class DatabaseManager:
 
         with cls.get_connection() as conn:
             cursor = conn.cursor()
+
+            # Garante que qualquer canal detectado na planilha conste em configuracoes_canais
+            for s in sales:
+                ch = s.get("canal")
+                if ch:
+                    cursor.execute("SELECT canal FROM configuracoes_canais WHERE canal = ?", (ch,))
+                    if not cursor.fetchone():
+                        def_rate = DEFAULT_CHANNEL_RATES.get(
+                            ch,
+                            {"taxa_comissao_pct": 20.0, "taxa_fixa_unidade": 5.0, "aliquota_imposto_pct": 8.0},
+                        )
+                        cursor.execute(
+                            """
+                            INSERT INTO configuracoes_canais (canal, taxa_comissao_pct, taxa_fixa_unidade, aliquota_imposto_pct)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (ch, def_rate["taxa_comissao_pct"], def_rate["taxa_fixa_unidade"], def_rate["aliquota_imposto_pct"]),
+                        )
+
             for s in sales:
                 pid = str(s["pedido_id"])
                 cursor.execute(
@@ -581,6 +615,34 @@ class DataProcessor:
         if s.endswith(".0"):
             s = s[:-2]
         return s
+
+    @staticmethod
+    def normalize_channel(raw_val: Any, default_channel: str = "Shopee") -> str:
+        """Normaliza o canal/marketplace vindo da planilha para a nomenclatura padrão do sistema."""
+        if raw_val is None or pd.isna(raw_val):
+            return default_channel
+        s = str(raw_val).strip()
+        if not s:
+            return default_channel
+        s_clean = s.lower()
+        if "shopee" in s_clean:
+            return "Shopee"
+        elif "tiktok" in s_clean or "tik tok" in s_clean or s_clean == "tts":
+            return "TikTok Shop"
+        elif "shein" in s_clean:
+            return "Shein"
+        elif "mercado" in s_clean or "livre" in s_clean or s_clean == "ml":
+            return "Mercado Livre"
+        elif "amazon" in s_clean:
+            return "Amazon"
+        elif "magalu" in s_clean or "magazine" in s_clean:
+            return "Magalu"
+        elif "kwai" in s_clean:
+            return "Kwai Shop"
+        elif "nuvem" in s_clean:
+            return "Nuvemshop"
+        else:
+            return s.title()
 
     @staticmethod
     def normalize_str(val: Any) -> str:
@@ -952,12 +1014,24 @@ class DataProcessor:
             ],
         )
 
-        rates = channel_configs.get(
-            canal,
-            DEFAULT_CHANNEL_RATES.get(
-                canal,
-                {"taxa_comissao_pct": 20.0, "taxa_fixa_unidade": 5.0, "aliquota_imposto_pct": 8.0},
-            ),
+        col_canal = cls.find_column(
+            cols,
+            [
+                "canal",
+                "canal de venda",
+                "canal da venda",
+                "plataforma",
+                "plataforma de venda",
+                "marketplace",
+                "nome da loja",
+                "loja",
+                "origem",
+                "origem da loja",
+                "platform",
+                "store",
+                "channel",
+                "tipo de canal",
+            ],
         )
 
         # Mapas de produtos para busca rápida O(1)
@@ -975,6 +1049,7 @@ class DataProcessor:
         processed_sales = []
         unmapped_items = []
         seen_order_ids: Dict[str, int] = {}
+        canais_contagem: Dict[str, int] = {}
 
         # Contagem prévia de quantas linhas cada venda/pedido possui no lote
         order_counts: Dict[str, int] = {}
@@ -1005,6 +1080,28 @@ class DataProcessor:
             else:
                 tag_item = "Item Único"
                 pedido_id = raw_order_id
+
+            # Identificação do canal de cada linha (planilha unificada ou canal fixo)
+            if col_canal and pd.notna(row[col_canal]) and str(row[col_canal]).strip():
+                row_canal = cls.normalize_channel(
+                    row[col_canal],
+                    default_channel=canal if canal not in ["Automático (Detectar pela Planilha Unificada)", "Automático", "Todos", ""] else "Shopee"
+                )
+            elif canal and canal not in ["Automático (Detectar pela Planilha Unificada)", "Automático", "Todos", ""]:
+                row_canal = canal
+            else:
+                row_canal = "Shopee"
+
+            canais_contagem[row_canal] = canais_contagem.get(row_canal, 0) + 1
+
+            # Busca as taxas específicas do canal desta linha
+            rates = channel_configs.get(
+                row_canal,
+                DEFAULT_CHANNEL_RATES.get(
+                    row_canal,
+                    {"taxa_comissao_pct": 20.0, "taxa_fixa_unidade": 5.0, "aliquota_imposto_pct": 8.0},
+                ),
+            )
 
             id_var = cls.clean_id_str(row[col_var_id]) if col_var_id and pd.notna(row[col_var_id]) else ""
             sku_val = cls.clean_id_str(row[col_sku]) if col_sku and pd.notna(row[col_sku]) else ""
@@ -1045,7 +1142,7 @@ class DataProcessor:
             if not matched:
                 preco_base = preco_up
                 custo_cmv = 0.0
-                unmapped_items.append({"pedido": pedido_id, "numero_venda": raw_order_id, "sku": sku_val, "variante": id_var, "preco_usado": preco_up})
+                unmapped_items.append({"pedido": pedido_id, "numero_venda": raw_order_id, "canal": row_canal, "sku": sku_val, "variante": id_var, "preco_usado": preco_up})
             else:
                 matched_count += 1
 
@@ -1053,7 +1150,7 @@ class DataProcessor:
             if preco_base <= 0:
                 preco_base = preco_up
 
-            # Fórmulas Oficiais de Cálculo
+            # Fórmulas Oficiais de Cálculo com taxas do canal da linha
             faturamento_bruto = round(preco_base * qtd, 2)
             valor_comissao = round(faturamento_bruto * (rates["taxa_comissao_pct"] / 100.0), 2)
             valor_taxa_fixa = round(rates["taxa_fixa_unidade"] * qtd, 2)
@@ -1072,7 +1169,7 @@ class DataProcessor:
                     "pedido_id": pedido_id,
                     "numero_venda": raw_order_id,
                     "tag_item": tag_item,
-                    "canal": canal,
+                    "canal": row_canal,
                     "id_variante": id_var,
                     "sku": sku_val,
                     "nome_anuncio": nome_anuncio,
@@ -1094,6 +1191,7 @@ class DataProcessor:
             "itens_conciliados": matched_count,
             "itens_nao_cadastrados": len(unmapped_items),
             "taxa_cobertura_pct": round((matched_count / total_itens * 100.0), 1) if total_itens > 0 else 0.0,
+            "canais_detectados": canais_contagem,
             "exemplos_nao_cadastrados": unmapped_items[:5],
         }
 
@@ -1733,7 +1831,7 @@ def main():
         with st.container():
             col_f1, col_f2, col_f3 = st.columns([1.3, 1.4, 2.3])
             with col_f1:
-                filtro_canal = st.selectbox("Canal / Marketplace:", ["Todos"] + CHANNELS, key="dash_canal")
+                filtro_canal = st.selectbox("Canal / Marketplace:", ["Todos"] + DatabaseManager.get_all_channels(), key="dash_canal")
             with col_f2:
                 preset_data = st.selectbox(
                     "Período Rápido:",
@@ -1992,7 +2090,7 @@ def main():
 
         col_up1, col_up2 = st.columns([1, 2])
         with col_up1:
-            canal_anuncio = st.selectbox("Selecione o Marketplace de Origem:", CHANNELS, key="sel_canal_anuncio")
+            canal_anuncio = st.selectbox("Selecione o Marketplace de Origem:", DatabaseManager.get_all_channels(), key="sel_canal_anuncio")
             file_anuncios = st.file_uploader(
                 "Carregar Planilha de Anúncios (.xlsx, .xls, .csv):",
                 type=["xlsx", "xls", "csv"],
@@ -2034,7 +2132,7 @@ def main():
             with col_search_prod:
                 busca_p = st.text_input("Buscar produto por SKU, ID Variante ou Nome:", key="busca_prod_catalogo")
             with col_filter_prod:
-                canal_p_filtro = st.selectbox("Filtrar Canal:", ["Todos"] + CHANNELS, key="canal_prod_catalogo")
+                canal_p_filtro = st.selectbox("Filtrar Canal:", ["Todos"] + DatabaseManager.get_all_channels(), key="canal_prod_catalogo")
 
             df_prods_filtered = df_prods.copy()
             if canal_p_filtro != "Todos":
@@ -2072,7 +2170,14 @@ def main():
 
         col_v1, col_v2 = st.columns([1, 2])
         with col_v1:
-            canal_vendas = st.selectbox("Canal do Relatório de Vendas:", CHANNELS, key="sel_canal_vendas")
+            opcoes_canais = ["Automático (Detectar pela Planilha Unificada)"] + DatabaseManager.get_all_channels()
+            canal_vendas = st.selectbox(
+                "Canal do Relatório de Vendas:",
+                opcoes_canais,
+                index=0,
+                key="sel_canal_vendas",
+                help="Se sua planilha for unificada (com vendas de Shopee, TikTok, Shein, Mercado Livre misturadas), selecione 'Automático'. O sistema identificará cada linha individualmente pela coluna da plataforma.",
+            )
             file_vendas = st.file_uploader(
                 "Carregar Relatório de Vendas (.xlsx, .xls, .csv):",
                 type=["xlsx", "xls", "csv"],
@@ -2102,6 +2207,22 @@ def main():
                     repetidos_lote = sum(1 for s in processed_sales if s["pedido_id"] in existing_pedido_ids)
                     novos_lote = len(processed_sales) - repetidos_lote
 
+                    # Badges visuais dos canais identificados no arquivo
+                    canais_detectados = stats.get("canais_detectados", {})
+                    cores_map = {
+                        "Shopee": ("#EE4D2D", "#FFF1EE", "🟠"),
+                        "TikTok Shop": ("#0F172A", "#F1F5F9", "⚫"),
+                        "Shein": ("#B45309", "#FEF3C7", "🟡"),
+                        "Mercado Livre": ("#854D0E", "#FEF9C3", "🟡"),
+                    }
+                    badges_canais_html = []
+                    for ch_nome, ch_count in canais_detectados.items():
+                        c_text, c_bg, c_icon = cores_map.get(ch_nome, ("#1E293B", "#F8FAFC", "🔵"))
+                        badges_canais_html.append(
+                            f'<span style="background: {c_bg}; color: {c_text}; border: 1px solid {c_text}40; padding: 2px 7px; border-radius: 6px; font-weight: 600; font-size: 0.85rem; margin-right: 6px; display: inline-block; margin-top: 3px;">{c_icon} {ch_nome}: {ch_count}</span>'
+                        )
+                    badges_str = " ".join(badges_canais_html) if badges_canais_html else "<i>Não especificado</i>"
+
                     # Exibe Estatísticas do Lote
                     cor_badge_rep = "#EF4444" if repetidos_lote > 0 else "#10B981"
                     st.markdown(
@@ -2111,6 +2232,7 @@ def main():
                             • Total de Linhas/Itens no Arquivo: <b>{stats['total_pedidos']}</b><br/>
                             • Novos Pedidos a Cadastrar: <b style="color: #10B981;">{novos_lote}</b><br/>
                             • Pedidos Repetidos (já existentes no banco): <b style="color: {cor_badge_rep};">{repetidos_lote}</b> (serão ignorados para não duplicar)<br/>
+                            • Separação por Canal/Marketplace: {badges_str}<br/>
                             • Itens Vinculados ao Catálogo de Anúncios: <b>{stats['itens_conciliados']}</b> ({stats['taxa_cobertura_pct']}% de cobertura)<br/>
                             • Itens sem Anúncio Pré-Cadastrado: <b>{stats['itens_nao_cadastrados']}</b> (utilizado preço de venda como fallback)<br/>
                         </div>
@@ -2135,7 +2257,7 @@ def main():
                     df_preview_conciliado = pd.DataFrame(processed_sales)
                     cols_preview = [
                         c for c in [
-                            "numero_venda", "tag_item", "pedido_id", "sku", "nome_anuncio", "quantidade",
+                            "numero_venda", "tag_item", "canal", "pedido_id", "sku", "nome_anuncio", "quantidade",
                             "preco_upseller_registrado", "preco_base_anuncio",
                             "faturamento_bruto", "total_taxas_canal", "valor_imposto",
                             "saque_liquido_previsto", "lucro_liquido_real"
@@ -2146,6 +2268,7 @@ def main():
                             df_preview_conciliado[cols_preview].rename(columns={
                                 "numero_venda": "Nº da Venda",
                                 "tag_item": "Tag / Linha",
+                                "canal": "Canal / Marketplace",
                                 "pedido_id": "ID Linha",
                                 "sku": "SKU",
                                 "nome_anuncio": "Nome do Anúncio",
@@ -2196,57 +2319,43 @@ def main():
         st.caption("Altere as comissões, taxa fixa por peça e alíquota de imposto (Simples Nacional) para cada canal.")
 
         configs_atuais = DatabaseManager.get_channel_configs()
+        all_channels = DatabaseManager.get_all_channels()
 
-        col_c1, col_c2, col_c3 = st.columns(3)
+        cores_map = {
+            "Shopee": ("#EE4D2D", "#FFF1EE", "🟠"),
+            "TikTok Shop": ("#0F172A", "#F1F5F9", "⚫"),
+            "Shein": ("#92400E", "#FEF3C7", "🟡"),
+            "Mercado Livre": ("#854D0E", "#FEF9C3", "🟡"),
+        }
+
         novas_taxas = {}
 
-        # Shopee
-        with col_c1:
-            st.markdown(
-                """
-                <div style="background: #fff1ee; border-radius: 8px; padding: 12px; border: 1px solid #fed7aa; margin-bottom: 10px;">
-                    <b style="color: #ee4d2d; font-size: 1.1rem;">🟠 Shopee</b>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            tax_shopee = configs_atuais.get("Shopee", DEFAULT_CHANNEL_RATES["Shopee"])
-            com_shopee = st.number_input("Comissão (%):", value=float(tax_shopee["taxa_comissao_pct"]), step=0.5, key="cfg_com_shopee")
-            fix_shopee = st.number_input("Taxa Fixa por Peça (R$):", value=float(tax_shopee["taxa_fixa_unidade"]), step=0.5, key="cfg_fix_shopee")
-            imp_shopee = st.number_input("Imposto Simples Nacional (%):", value=float(tax_shopee["aliquota_imposto_pct"]), step=0.5, key="cfg_imp_shopee")
-            novas_taxas["Shopee"] = {"taxa_comissao_pct": com_shopee, "taxa_fixa_unidade": fix_shopee, "aliquota_imposto_pct": imp_shopee}
-
-        # TikTok Shop
-        with col_c2:
-            st.markdown(
-                """
-                <div style="background: #f1f5f9; border-radius: 8px; padding: 12px; border: 1px solid #cbd5e1; margin-bottom: 10px;">
-                    <b style="color: #0f172a; font-size: 1.1rem;">⚫ TikTok Shop</b>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            tax_tiktok = configs_atuais.get("TikTok Shop", DEFAULT_CHANNEL_RATES["TikTok Shop"])
-            com_tiktok = st.number_input("Comissão (%):", value=float(tax_tiktok["taxa_comissao_pct"]), step=0.5, key="cfg_com_tiktok")
-            fix_tiktok = st.number_input("Taxa Fixa por Peça (R$):", value=float(tax_tiktok["taxa_fixa_unidade"]), step=0.5, key="cfg_fix_tiktok")
-            imp_tiktok = st.number_input("Imposto Simples Nacional (%):", value=float(tax_tiktok["aliquota_imposto_pct"]), step=0.5, key="cfg_imp_tiktok")
-            novas_taxas["TikTok Shop"] = {"taxa_comissao_pct": com_tiktok, "taxa_fixa_unidade": fix_tiktok, "aliquota_imposto_pct": imp_tiktok}
-
-        # Shein
-        with col_c3:
-            st.markdown(
-                """
-                <div style="background: #fef3c7; border-radius: 8px; padding: 12px; border: 1px solid #fde68a; margin-bottom: 10px;">
-                    <b style="color: #92400e; font-size: 1.1rem;">🟡 Shein</b>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            tax_shein = configs_atuais.get("Shein", DEFAULT_CHANNEL_RATES["Shein"])
-            com_shein = st.number_input("Comissão (%):", value=float(tax_shein["taxa_comissao_pct"]), step=0.5, key="cfg_com_shein")
-            fix_shein = st.number_input("Taxa Fixa por Peça (R$):", value=float(tax_shein["taxa_fixa_unidade"]), step=0.5, key="cfg_fix_shein")
-            imp_shein = st.number_input("Imposto Simples Nacional (%):", value=float(tax_shein["aliquota_imposto_pct"]), step=0.5, key="cfg_imp_shein")
-            novas_taxas["Shein"] = {"taxa_comissao_pct": com_shein, "taxa_fixa_unidade": fix_shein, "aliquota_imposto_pct": imp_shein}
+        # Renderização dinâmica em colunas balanceadas para todos os canais
+        num_cols = min(len(all_channels), 4) if all_channels else 1
+        cols_grid = st.columns(num_cols)
+        for idx, canal_nome in enumerate(all_channels):
+            with cols_grid[idx % num_cols]:
+                c_text, c_bg, c_icon = cores_map.get(canal_nome, ("#1E293B", "#F8FAFC", "🔵"))
+                st.markdown(
+                    f"""
+                    <div style="background: {c_bg}; border-radius: 8px; padding: 12px; border: 1px solid {c_text}40; margin-bottom: 10px;">
+                        <b style="color: {c_text}; font-size: 1.05rem;">{c_icon} {canal_nome}</b>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+                tax_info = configs_atuais.get(
+                    canal_nome,
+                    DEFAULT_CHANNEL_RATES.get(
+                        canal_nome,
+                        {"taxa_comissao_pct": 20.0, "taxa_fixa_unidade": 5.0, "aliquota_imposto_pct": 8.0},
+                    ),
+                )
+                safe_key = re.sub(r'[^a-zA-Z0-9_]', '_', canal_nome).lower()
+                com_val = st.number_input(f"Comissão ({canal_nome}) %:", value=float(tax_info["taxa_comissao_pct"]), step=0.5, key=f"cfg_com_{safe_key}")
+                fix_val = st.number_input(f"Taxa Fixa ({canal_nome}) R$:", value=float(tax_info["taxa_fixa_unidade"]), step=0.5, key=f"cfg_fix_{safe_key}")
+                imp_val = st.number_input(f"Imposto DAS ({canal_nome}) %:", value=float(tax_info["aliquota_imposto_pct"]), step=0.5, key=f"cfg_imp_{safe_key}")
+                novas_taxas[canal_nome] = {"taxa_comissao_pct": com_val, "taxa_fixa_unidade": fix_val, "aliquota_imposto_pct": imp_val}
 
         if st.button("💾 Salvar Novas Taxas no Banco", type="primary", key="btn_save_taxas"):
             for canal, t in novas_taxas.items():

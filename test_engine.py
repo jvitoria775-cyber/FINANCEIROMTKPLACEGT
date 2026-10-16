@@ -247,6 +247,93 @@ def run_tests():
     assert atus_reimp == 3, "Deveria ter atualizado as 3 vendas existentes sem duplicar"
     print("✅ 11. Taggeamento de pedidos multilinhas e prevenção de duplicações validados com sucesso.")
 
+    # 12. Teste de Separação Automática de Canais em Planilha Unificada (UpSeller)
+    uni_sales_df = pd.DataFrame([
+        {
+            "Plataforma": "Shopee Brasil",
+            "Número da Venda": "PED_UNI_SHP_101",
+            "ID da Variante": "VAR_SHP_001",
+            "SKU": "CAMISA-PRETA-G",
+            "Nome do Produto": "Camisa Polo Algodão",
+            "Quantidade": 1,
+            "Preço de Produto": 85.00,
+        },
+        {
+            "Plataforma": "TikTok Shop Oficial",
+            "Número da Venda": "PED_UNI_TTS_102",
+            "ID da Variante": "VAR_TT_002",
+            "SKU": "VESTIDO-FLORAL-M",
+            "Nome do Produto": "Vestido Midi Floral",
+            "Quantidade": 1,
+            "Preço de Produto": 110.00,
+        },
+        {
+            "Plataforma": "SHEIN",
+            "Número da Venda": "PED_UNI_SHN_103",
+            "ID da Variante": "VAR_SHP_001",
+            "SKU": "CAMISA-PRETA-G",
+            "Nome do Produto": "Camisa Polo Algodão",
+            "Quantidade": 1,
+            "Preço de Produto": 90.00,
+        },
+        {
+            "Plataforma": "Mercado Livre",
+            "Número da Venda": "PED_UNI_MLB_104",
+            "ID da Variante": "VAR_TT_002",
+            "SKU": "VESTIDO-FLORAL-M",
+            "Nome do Produto": "Vestido Midi Floral",
+            "Quantidade": 1,
+            "Preço de Produto": 130.00,
+        },
+    ])
+
+    current_configs = DatabaseManager.get_channel_configs()
+    processed_uni, stats_uni = DataProcessor.reconcile_sales_batch(
+        df_sales=uni_sales_df,
+        canal="Automático (Detectar pela Planilha Unificada)",
+        channel_configs=current_configs,
+        products_df=prods_df,
+    )
+
+    assert len(processed_uni) == 4, f"Deveriam ter sido processadas 4 vendas unificadas, obtido {len(processed_uni)}"
+    assert stats_uni["canais_detectados"]["Shopee"] == 1
+    assert stats_uni["canais_detectados"]["TikTok Shop"] == 1
+    assert stats_uni["canais_detectados"]["Shein"] == 1
+    assert stats_uni["canais_detectados"]["Mercado Livre"] == 1
+
+    # Valida taxas individuais de cada canal
+    u_shp = processed_uni[0]
+    assert u_shp["canal"] == "Shopee"
+    # Preço base: 105.00, Com: 18% (18.90), Fixa: 5.00 -> total taxas: 23.90
+    assert u_shp["total_taxas_canal"] == 23.90, f"Taxas Shopee incorretas: {u_shp['total_taxas_canal']}"
+
+    u_tts = processed_uni[1]
+    assert u_tts["canal"] == "TikTok Shop"
+    # Preço base: 150.00, Com: 22% (33.00), Fixa: 5.00 -> total taxas: 38.00
+    assert u_tts["total_taxas_canal"] == 38.00, f"Taxas TikTok Shop incorretas: {u_tts['total_taxas_canal']}"
+
+    u_shn = processed_uni[2]
+    assert u_shn["canal"] == "Shein"
+    # Preço base: 105.00, Com: 20% (21.00), Fixa: 4.00 -> total taxas: 25.00
+    assert u_shn["total_taxas_canal"] == 25.00, f"Taxas Shein incorretas: {u_shn['total_taxas_canal']}"
+
+    u_mlb = processed_uni[3]
+    assert u_mlb["canal"] == "Mercado Livre"
+    # Preço base: 150.00, Com: 19% (28.50), Fixa: 6.00 -> total taxas: 34.50
+    assert u_mlb["total_taxas_canal"] == 34.50, f"Taxas Mercado Livre incorretas: {u_mlb['total_taxas_canal']}"
+
+    # Gravar no banco e testar persistência e auto-cadastro do canal Mercado Livre
+    novas_u, rep_u = DatabaseManager.upsert_sales(processed_uni, ignorar_existentes=True)
+    assert novas_u == 4 and rep_u == 0, f"Esperado 4 novas vendas unificadas inseridas, obtido novas={novas_u}, rep={rep_u}"
+
+    all_channels_db = DatabaseManager.get_all_channels()
+    assert "Mercado Livre" in all_channels_db, "Mercado Livre deveria estar cadastrado nos canais do banco"
+
+    # Reimportar exatamente o mesmo lote com proteção antiduplicação ativa
+    novas_u2, rep_u2 = DatabaseManager.upsert_sales(processed_uni, ignorar_existentes=True)
+    assert novas_u2 == 0 and rep_u2 == 4, f"Esperado 0 novas e 4 repetidas ignoradas, obtido novas={novas_u2}, rep={rep_u2}"
+    print("✅ 12. Separação multicanal automática em planilha unificada e proteção antiduplicação validadas com 100% de sucesso.")
+
     print("=" * 60)
     print("TODOS OS TESTES PASSARAM COM SUCESSO! 🎉")
     print("=" * 60)
