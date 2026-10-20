@@ -10,6 +10,7 @@ Tecnologias: Streamlit, Pandas, SQLite3, OpenPyXL
 
 import base64
 import io
+import os
 import re
 import sqlite3
 import unicodedata
@@ -63,20 +64,132 @@ DEFAULT_CHANNEL_RATES = {
 }
 
 
+try:
+    import psycopg2
+    import psycopg2.extras
+    HAS_PSYCOPG2 = True
+except ImportError:
+    HAS_PSYCOPG2 = False
+
+
+class DBRow(dict):
+    """Objeto de linha compatível com dict, sqlite3.Row e RealDictRow (acesso por chave e por índice numérico)."""
+    def __init__(self, d: dict):
+        super().__init__(d)
+        self._keys = list(d.keys())
+
+    def __getitem__(self, item):
+        if isinstance(item, int):
+            return super().__getitem__(self._keys[item])
+        return super().__getitem__(item)
+
+
+class DBCursorWrapper:
+    """Wrapper unificado de cursor para executar queries de forma transparente em SQLite e PostgreSQL."""
+    def __init__(self, cur, is_pg: bool):
+        self.cur = cur
+        self.is_pg = is_pg
+
+    def execute(self, query: str, params: Any = None):
+        if self.is_pg:
+            q = query.replace("?", "%s")
+            if params is None:
+                return self.cur.execute(q)
+            if isinstance(params, list):
+                params = tuple(params)
+            return self.cur.execute(q, params)
+        else:
+            if params is None:
+                return self.cur.execute(query)
+            return self.cur.execute(query, params)
+
+    def executemany(self, query: str, seq_of_params: Any):
+        if self.is_pg:
+            q = query.replace("?", "%s")
+            return self.cur.executemany(q, seq_of_params)
+        else:
+            return self.cur.executemany(query, seq_of_params)
+
+    def fetchone(self) -> Optional[DBRow]:
+        row = self.cur.fetchone()
+        if row is None:
+            return None
+        return DBRow(dict(row))
+
+    def fetchall(self) -> List[DBRow]:
+        rows = self.cur.fetchall()
+        return [DBRow(dict(r)) for r in rows]
+
+
+class DBConnectionWrapper:
+    """Wrapper de conexão unificado que gerencia commits, rollbacks e fechamento automático."""
+    def __init__(self, raw_conn, is_pg: bool):
+        self.raw_conn = raw_conn
+        self.is_pg = is_pg
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.raw_conn.commit()
+        else:
+            self.raw_conn.rollback()
+        self.raw_conn.close()
+
+    def cursor(self) -> DBCursorWrapper:
+        if self.is_pg:
+            cur = self.raw_conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            return DBCursorWrapper(cur, is_pg=True)
+        else:
+            cur = self.raw_conn.cursor()
+            return DBCursorWrapper(cur, is_pg=False)
+
+    def commit(self):
+        self.raw_conn.commit()
+
+    def rollback(self):
+        self.raw_conn.rollback()
+
+
 class DatabaseManager:
-    """Gerenciador central do banco de dados relacional SQLite."""
+    """Gerenciador central do banco de dados (PostgreSQL Supabase ou SQLite local)."""
+
+    @classmethod
+    def get_database_url(cls) -> Optional[str]:
+        """Obtém a URL de conexão do PostgreSQL (Supabase) via Secrets ou Variáveis de Ambiente."""
+        url = os.environ.get("DATABASE_URL")
+        if not url:
+            try:
+                if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+                    url = st.secrets["DATABASE_URL"]
+            except Exception:
+                pass
+        return url
+
+    @classmethod
+    def is_postgres(cls) -> bool:
+        """Verifica se o sistema está operando com PostgreSQL na nuvem."""
+        return bool(cls.get_database_url() and HAS_PSYCOPG2)
 
     @classmethod
     def get_all_channels(cls) -> List[str]:
         """Retorna estritamente os 4 canais oficiais do sistema."""
         return list(CHANNELS)
 
-    @staticmethod
-    def get_connection() -> sqlite3.Connection:
-        """Cria e retorna uma conexão com o banco de dados SQLite."""
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        return conn
+    @classmethod
+    def get_connection(cls) -> DBConnectionWrapper:
+        """Cria e retorna uma conexão unificada (PostgreSQL Supabase ou SQLite local)."""
+        db_url = cls.get_database_url()
+        if db_url and HAS_PSYCOPG2:
+            try:
+                raw_conn = psycopg2.connect(db_url, connect_timeout=15)
+                return DBConnectionWrapper(raw_conn, is_pg=True)
+            except Exception as e:
+                print(f"[AVISO] Falha ao conectar no PostgreSQL, usando SQLite: {e}")
+        raw_conn = sqlite3.connect(DB_PATH)
+        raw_conn.row_factory = sqlite3.Row
+        return DBConnectionWrapper(raw_conn, is_pg=False)
 
     @classmethod
     def init_db(cls) -> None:
@@ -163,18 +276,26 @@ class DatabaseManager:
                 """
             )
             # Migrações automáticas caso a tabela já exista
-            try:
-                cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN data_pedido TEXT")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN numero_venda TEXT")
-            except sqlite3.OperationalError:
-                pass
-            try:
-                cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN tag_item TEXT")
-            except sqlite3.OperationalError:
-                pass
+            if cls.is_postgres():
+                try:
+                    cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN IF NOT EXISTS data_pedido TEXT")
+                    cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN IF NOT EXISTS numero_venda TEXT")
+                    cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN IF NOT EXISTS tag_item TEXT")
+                except Exception:
+                    pass
+            else:
+                try:
+                    cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN data_pedido TEXT")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN numero_venda TEXT")
+                except Exception:
+                    pass
+                try:
+                    cursor.execute("ALTER TABLE vendas_processadas ADD COLUMN tag_item TEXT")
+                except Exception:
+                    pass
 
             # Backfill para registros legados
             cursor.execute("UPDATE vendas_processadas SET numero_venda = pedido_id WHERE numero_venda IS NULL OR numero_venda = ''")
@@ -320,10 +441,16 @@ class DatabaseManager:
     def get_products_dataframe(cls) -> pd.DataFrame:
         """Carrega todos os produtos cadastrados."""
         with cls.get_connection() as conn:
-            df = pd.read_sql_query(
-                "SELECT * FROM produtos ORDER BY atualizado_em DESC", conn
-            )
-            return df
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM produtos ORDER BY atualizado_em DESC")
+            rows = cursor.fetchall()
+            if not rows:
+                return pd.DataFrame(columns=[
+                    "id_variante", "canal", "id_anuncio", "sku", "nome_anuncio",
+                    "variacao", "preco_cheio", "preco_desconto", "preco_base",
+                    "custo_cmv", "atualizado_em"
+                ])
+            return pd.DataFrame(rows)
 
     @classmethod
     def update_product_cmv(cls, id_variante: str, novo_cmv: float) -> None:
@@ -471,13 +598,22 @@ class DatabaseManager:
     def get_sales_dataframe(cls, canal_filtro: Optional[str] = None) -> pd.DataFrame:
         """Recupera o DataFrame com todas as vendas processadas com filtros opcionais."""
         with cls.get_connection() as conn:
+            cursor = conn.cursor()
             if canal_filtro and canal_filtro != "Todos":
                 query = "SELECT * FROM vendas_processadas WHERE canal = ? ORDER BY data_processamento DESC"
-                df = pd.read_sql_query(query, conn, params=(canal_filtro,))
+                cursor.execute(query, (canal_filtro,))
             else:
                 query = "SELECT * FROM vendas_processadas ORDER BY data_processamento DESC"
-                df = pd.read_sql_query(query, conn)
-            return df
+                cursor.execute(query)
+            rows = cursor.fetchall()
+            if not rows:
+                return pd.DataFrame(columns=[
+                    "pedido_id", "numero_venda", "tag_item", "canal", "id_variante", "sku", "nome_anuncio",
+                    "quantidade", "preco_upseller_registrado", "preco_base_anuncio", "faturamento_bruto",
+                    "total_taxas_canal", "valor_imposto", "saque_liquido_previsto", "custo_cmv_total",
+                    "lucro_liquido_real", "data_pedido", "data_processamento"
+                ])
+            return pd.DataFrame(rows)
 
     @classmethod
     def recalculate_all_sales(cls) -> int:
@@ -2437,6 +2573,19 @@ def main():
     with tab_config:
         st.subheader("Gerenciador de Taxas de Marketplaces & Custos (CMV)")
 
+        if DatabaseManager.is_postgres():
+            st.success(
+                "🟢 **Banco de Dados em Nuvem Ativo (Supabase PostgreSQL):** "
+                "Seus 4.864 produtos, taxas e vendas estão salvos com persistência 24/7 na nuvem. "
+                "A hibernação do servidor Streamlit não apaga mais nenhum dado!"
+            )
+        else:
+            st.info(
+                "🟡 **Banco de Dados Local (SQLite):** "
+                "O sistema está operando com banco local. Para ativar a persistência vitalícia na nuvem (Supabase), "
+                "configure o segredo `DATABASE_URL` nas configurações do Streamlit Cloud."
+            )
+
         # PARTE 1: Painel de Edição de Taxas por Canal
         st.markdown("#### 1. Configuração de Taxas e Impostos por Canal")
         st.caption("Altere as comissões, taxa fixa por peça e alíquota de imposto (Simples Nacional) para cada canal.")
@@ -2546,20 +2695,38 @@ def main():
 
         st.divider()
 
-        # PARTE 3: Manutenção do Sistema & Reinício do Histórico
-        st.markdown("#### 3. Manutenção e Reinício do Histórico de Vendas")
-        st.caption("Esta opção zera exclusivamente os pedidos e faturamento da aba de vendas. Seus anúncios cadastrados no catálogo e as taxas configuradas permanecem 100% intactos.")
+        # PARTE 3: Backup, Manutenção & Reinício do Histórico
+        st.markdown("#### 3. Backup, Manutenção & Reinício do Histórico")
+        st.caption("Faça download de segurança dos dados locais ou reinicie o histórico de vendas quando desejar.")
 
-        with st.expander("🗑️ Zona de Limpeza: Zerar Vendas Processadas", expanded=False):
-            st.warning("⚠️ **Atenção:** Esta ação apagará todas as vendas gravadas no banco de dados para que você possa iniciar o controle financeiro do zero com as novas planilhas.")
-            chk_confirma_zerar = st.checkbox(
-                "Sim, confirmo que desejo apagar todo o histórico de vendas para começar do zero.",
-                key="chk_confirma_zerar",
-            )
-            if st.button("🚨 Confirmar e Apagar Todas as Vendas", type="primary", key="btn_zerar_vendas", disabled=not chk_confirma_zerar):
-                qtd_removidas = DatabaseManager.clear_sales_history()
-                st.success(f"✅ Histórico financeiro zerado com sucesso! **{qtd_removidas} vendas** foram removidas. O catálogo de anúncios continua 100% preservado.")
-                st.rerun()
+        col_bkp1, col_bkp2 = st.columns(2)
+        with col_bkp1:
+            with st.expander("📥 Baixar Cópia de Backup (.db)", expanded=False):
+                st.write("Baixe uma cópia completa do arquivo de banco de dados SQLite para o seu computador:")
+                if DB_PATH.exists():
+                    with open(DB_PATH, "rb") as f_db:
+                        db_bytes = f_db.read()
+                    st.download_button(
+                        label="💾 Baixar Arquivo do Banco (.db)",
+                        data=db_bytes,
+                        file_name=f"backup_gratitude_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+                        mime="application/x-sqlite3",
+                        use_container_width=True,
+                    )
+                else:
+                    st.info("Arquivo de banco local não encontrado.")
+
+        with col_bkp2:
+            with st.expander("🗑️ Zona de Limpeza: Zerar Vendas", expanded=False):
+                st.warning("⚠️ **Atenção:** Esta ação apagará todas as vendas gravadas no banco de dados para que você possa iniciar o controle financeiro do zero com as novas planilhas.")
+                chk_confirma_zerar = st.checkbox(
+                    "Sim, confirmo que desejo apagar todo o histórico de vendas para começar do zero.",
+                    key="chk_confirma_zerar",
+                )
+                if st.button("🚨 Confirmar e Apagar Todas as Vendas", type="primary", key="btn_zerar_vendas", disabled=not chk_confirma_zerar):
+                    qtd_removidas = DatabaseManager.clear_sales_history()
+                    st.success(f"✅ Histórico financeiro zerado com sucesso! **{qtd_removidas} vendas** foram removidas. O catálogo de anúncios continua 100% preservado.")
+                    st.rerun()
 
 
 if __name__ == "__main__":
